@@ -143,8 +143,12 @@ app.post("/analyze", async (req, res) => {
     const { message, mode, turnstileToken } = req.body;
 
     if (!message || !message.trim()) {
-      return res.status(400).json({ error: "Message is required." });
-    }
+  return res.status(400).json({ error: "Message is required." });
+}
+
+if (message.trim().length > 1000) {
+  return res.status(400).json({ error: "Message is too long. Please keep it under 1000 characters." });
+}
 
     if (!mode || !["workplace", "relationship", "rizz", "negotiation"].includes(mode)) {
       return res.status(400).json({ error: "Valid mode is required." });
@@ -170,7 +174,9 @@ const formData = new URLSearchParams();
     if (!turnstileResult.success) {
       return res.status(403).json({ error: "Verification failed. Please try again." });
     }
-
+if (!process.env.OPENAI_API_KEY) {
+  return res.status(500).json({ error: "AI service is not configured." });
+}
     const response = await client.chat.completions.create({
       model: "gpt-5.4-nano",
       response_format: { type: "json_object" },
