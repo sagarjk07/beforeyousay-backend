@@ -140,7 +140,7 @@ function formatFallback(mode, message, data) {
 
 app.post("/analyze", async (req, res) => {
   try {
-    const { message, mode } = req.body;
+    const { message, mode, turnstileToken } = req.body;
 
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Message is required." });
