@@ -2,13 +2,13 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
+const rateLimit = require("express-rate-limit");
 
 dotenv.config();
 
 const app = express();
 
 app.use(cors());
-
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (req, res) => {
@@ -138,17 +138,25 @@ function formatFallback(mode, message, data) {
   };
 }
 
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: "Too many requests. Please wait a minute and try again." },
+});
+
+app.use("/analyze", limiter);
+
 app.post("/analyze", async (req, res) => {
   try {
     const { message, mode, turnstileToken } = req.body;
 
     if (!message || !message.trim()) {
-  return res.status(400).json({ error: "Message is required." });
-}
+      return res.status(400).json({ error: "Message is required." });
+    }
 
-if (message.trim().length > 1000) {
-  return res.status(400).json({ error: "Message is too long. Please keep it under 1000 characters." });
-}
+    if (message.trim().length > 1000) {
+      return res.status(400).json({ error: "Message is too long. Please keep it under 1000 characters." });
+    }
 
     if (!mode || !["workplace", "relationship", "rizz", "negotiation"].includes(mode)) {
       return res.status(400).json({ error: "Valid mode is required." });
@@ -157,10 +165,12 @@ if (message.trim().length > 1000) {
     if (!turnstileToken) {
       return res.status(400).json({ error: "Verification is required." });
     }
+
     if (!process.env.TURNSTILE_SECRET_KEY) {
       return res.status(500).json({ error: "Server verification is not configured." });
-   
-const formData = new URLSearchParams();
+    }
+
+    const formData = new URLSearchParams();
     formData.append("secret", process.env.TURNSTILE_SECRET_KEY);
     formData.append("response", turnstileToken);
 
@@ -174,9 +184,11 @@ const formData = new URLSearchParams();
     if (!turnstileResult.success) {
       return res.status(403).json({ error: "Verification failed. Please try again." });
     }
-if (!process.env.OPENAI_API_KEY) {
-  return res.status(500).json({ error: "AI service is not configured." });
-}
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "AI service is not configured." });
+    }
+
     const response = await client.chat.completions.create({
       model: "gpt-5.4-nano",
       response_format: { type: "json_object" },
