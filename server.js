@@ -1,5 +1,13 @@
 const express = require("express");
-const cors = require("cors");
+const cors = require('cors');
+
+app.use(cors({
+  origin: ['https://beforeyousay.com', 'https://www.beforeyousay.com'],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type']
+}));
+
+app.options('*', cors());
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
 
