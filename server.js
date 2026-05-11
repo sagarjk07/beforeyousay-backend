@@ -1,8 +1,4 @@
 const express = require("express");
-app.get('/', (req, res) => {
-  res.send('BeforeYouSay backend is live');
-});
-
 const cors = require("cors");
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
@@ -12,6 +8,10 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+app.get("/", (req, res) => {
+  res.send("BeforeYouSay backend is live");
+});
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -58,4 +58,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
