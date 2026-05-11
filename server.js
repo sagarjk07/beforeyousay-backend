@@ -1,4 +1,8 @@
 const express = require("express");
+app.get('/', (req, res) => {
+  res.send('BeforeYouSay backend is live');
+});
+
 const cors = require("cors");
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
