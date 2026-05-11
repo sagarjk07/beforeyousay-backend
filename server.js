@@ -143,12 +143,43 @@ const limiter = rateLimit({
   max: 10,
   message: { error: "Too many requests. Please wait a minute and try again." },
 });
+function buildReplyPrompt(mode) {
+  return `
+You are BeforeYouSay, an elite AI communication coach.
 
+The user will paste a message they RECEIVED from someone else.
+Your job is to suggest 3 different replies the user could send back.
+
+Mode: ${mode}
+
+Return valid JSON only in this exact structure:
+{
+  "tone_detected": "string — the tone of the message they received",
+  "why_it_might_land_badly": "string — what to watch out for when replying",
+  "better_version": "string — the best balanced reply",
+  "softer_version": "string — a warmer, more open reply",
+  "stronger_version": "string — a more direct, assertive reply",
+  "coach_note": "string — one short tactical tip for this reply",
+  "risk_level": "low",
+  "should_send": "yes",
+  "intent_guess": "string — what the sender likely meant",
+  "original_message": "",
+  "scores": { "clarity": 8, "confidence": 8, "emotional_control": 8, "effectiveness": 8 }
+}
+
+Rules:
+- All 3 replies must be things the USER says BACK to the sender.
+- Do not rewrite the received message. Generate actual reply options.
+- Keep replies natural, human, and mode-appropriate.
+- Do not use emojis unless the mode is rizz.
+- coach_note should be one sentence of tactical advice.
+`;
+}
 app.use("/analyze", limiter);
 
 app.post("/analyze", async (req, res) => {
   try {
-    const { message, mode, turnstileToken } = req.body;
+    const { message, mode, turnstileToken, replyMode } = req.body;
 
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Message is required." });
@@ -194,10 +225,7 @@ app.post("/analyze", async (req, res) => {
       response_format: { type: "json_object" },
       temperature: 0.8,
       messages: [
-        {
-          role: "system",
-          content: buildSystemPrompt(mode),
-        },
+       { role: "system", content: replyMode ? buildReplyPrompt(mode) : buildSystemPrompt(mode) },
         {
           role: "user",
           content: `Analyze and improve this message:\n\n${message.trim()}`,
