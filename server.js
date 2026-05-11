@@ -144,27 +144,29 @@ const limiter = rateLimit({
   message: { error: "Too many requests. Please wait a minute and try again." },
 });
 function buildReplyPrompt(mode) {
+  const modeInstructions = {
+    workplace: `You are helping someone reply professionally. Replies must be calm, clear, and boundary-aware. No slang. Keep it respectful and concise.`,
+    relationship: `You are helping someone reply in a relationship context. Replies must be emotionally intelligent, honest, warm, and de-escalating. No blame or coldness.`,
+    rizz: `You are helping someone reply with rizz — charm, wit, and confidence. Replies must be smooth, playful, and slightly cocky without being desperate or cringe. Think: unbothered, funny, attractive energy. Never formal. Never "I respect that." Never "no worries." Keep it short and punchy.`,
+    negotiation: `You are helping someone reply in a negotiation. Replies must be assertive, strategic, and calm. Show leverage without desperation. Stay in control.`
+  };
+
   return `
 You are BeforeYouSay, an elite AI communication coach.
 
 The user will paste a message they RECEIVED from someone else.
 Your job is to suggest 3 different replies the user could send back.
 
-Mode: ${mode}
-
-${mode === 'workplace' ? 'Keep replies professional, calm, and boundary-aware. No slang.' : ''}
-${mode === 'relationship' ? 'Keep replies emotionally intelligent, honest, and de-escalating. No blame.' : ''}
-${mode === 'rizz' ? 'Keep replies charming, witty, and confident. Think smooth not simp. Light humor is good.' : ''}
-${mode === 'negotiation' ? 'Keep replies assertive, strategic, and leverage-aware. Stay calm and in control.' : ''}
+${modeInstructions[mode] || modeInstructions.workplace}
 
 Return valid JSON only in this exact structure:
 {
   "tone_detected": "string — the tone of the message they received",
   "why_it_might_land_badly": "string — what to watch out for when replying",
-  "better_version": "string — the best balanced reply",
-  "softer_version": "string — a warmer, more open reply",
-  "stronger_version": "string — a more direct, assertive reply",
-  "coach_note": "string — one short tactical tip for this reply",
+  "better_version": "string — the best balanced reply for this mode",
+  "softer_version": "string — a softer or warmer version of the reply",
+  "stronger_version": "string — a more direct or assertive reply",
+  "coach_note": "string — one short tactical tip for this specific situation",
   "risk_level": "low",
   "should_send": "yes",
   "intent_guess": "string — what the sender likely meant",
@@ -173,11 +175,10 @@ Return valid JSON only in this exact structure:
 }
 
 Rules:
-- All 3 replies must be things the USER says BACK to the sender.
-- Do not rewrite the received message. Generate actual reply options.
-- Keep replies natural, human, and mode-appropriate.
-- Do not use emojis unless the mode is rizz.
-- coach_note should be one sentence of tactical advice.
+- All 3 replies must be things the USER sends BACK. Not rewrites of the received message.
+- Replies must match the mode tone strictly — especially for rizz, be smooth and witty not polite.
+- Keep replies short and natural. No corporate speak. No over-explaining.
+- coach_note must be one punchy sentence of tactical advice.
 `;
 }
 app.use("/analyze", limiter);
