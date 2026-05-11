@@ -38,19 +38,26 @@ function getPrompt(mode, message) {
 }
 
 app.post("/analyze", async (req, res) => {
-  const { message, mode } = req.body;
+  try {
+    const { message, mode } = req.body;
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: "You are BeforeYouSay AI." },
-      { role: "user", content: getPrompt(mode, message) }
-    ],
-  });
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are BeforeYouSay AI." },
+        { role: "user", content: getPrompt(mode, message) }
+      ],
+    });
 
-  res.json({
-    result: response.choices[0].message.content,
-  });
+    res.json({
+      result: response.choices[0].message.content,
+    });
+  } catch (error) {
+    console.error("OpenAI error:", error.message);
+    res.status(500).json({
+      error: error.message || "Something went wrong",
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
