@@ -153,7 +153,9 @@ app.post("/analyze", async (req, res) => {
     if (!turnstileToken) {
       return res.status(400).json({ error: "Verification is required." });
     }
-
+    if (!process.env.TURNSTILE_SECRET_KEY) {
+      return res.status(500).json({ error: "Server verification is not configured." });
+    }
        const formData = new URLSearchParams();
     formData.append("secret", process.env.TURNSTILE_SECRET_KEY);
     formData.append("response", turnstileToken);
