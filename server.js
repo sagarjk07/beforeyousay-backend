@@ -154,6 +154,21 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ error: "Verification is required." });
     }
 
+       const formData = new URLSearchParams();
+    formData.append("secret", process.env.TURNSTILE_SECRET_KEY);
+    formData.append("response", turnstileToken);
+
+    const turnstileResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      body: formData,
+    });
+
+    const turnstileResult = await turnstileResponse.json();
+
+    if (!turnstileResult.success) {
+      return res.status(403).json({ error: "Verification failed. Please try again." });
+    }
+
     const response = await client.chat.completions.create({
       model: "gpt-5.4-nano",
       response_format: { type: "json_object" },
