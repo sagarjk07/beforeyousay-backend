@@ -150,6 +150,10 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ error: "Valid mode is required." });
     }
 
+    if (!turnstileToken) {
+      return res.status(400).json({ error: "Verification is required." });
+    }
+
     const response = await client.chat.completions.create({
       model: "gpt-5.4-nano",
       response_format: { type: "json_object" },
