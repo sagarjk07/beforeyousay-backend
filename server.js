@@ -1,13 +1,31 @@
 const express = require("express");
+const express = require('express');
 const cors = require('cors');
 
+const app = express();  // <- app must exist FIRST
+
+// CORS goes AFTER app is created
 app.use(cors({
   origin: ['https://beforeyousay.com', 'https://www.beforeyousay.com'],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type']
 }));
 
-app.options('*', cors());
+app.use(express.json());
+
+// Your routes here
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'BeforeYouSay backend', time: new Date().toISOString() });
+});
+
+app.post('/analyze', (req, res) => {
+  // your analysis code
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
 
