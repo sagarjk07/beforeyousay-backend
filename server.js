@@ -152,6 +152,11 @@ Your job is to suggest 3 different replies the user could send back.
 
 Mode: ${mode}
 
+${mode === 'workplace' ? 'Keep replies professional, calm, and boundary-aware. No slang.' : ''}
+${mode === 'relationship' ? 'Keep replies emotionally intelligent, honest, and de-escalating. No blame.' : ''}
+${mode === 'rizz' ? 'Keep replies charming, witty, and confident. Think smooth not simp. Light humor is good.' : ''}
+${mode === 'negotiation' ? 'Keep replies assertive, strategic, and leverage-aware. Stay calm and in control.' : ''}
+
 Return valid JSON only in this exact structure:
 {
   "tone_detected": "string — the tone of the message they received",
