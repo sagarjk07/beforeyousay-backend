@@ -49,9 +49,13 @@ app.post("/analyze", async (req, res) => {
       ],
     });
 
-    res.json({
-      result: response.choices[0].message.content,
-    });
+    console.log("FULL OPENAI RESPONSE:", JSON.stringify(response, null, 2));
+
+    const result =
+      response?.choices?.[0]?.message?.content ||
+      "AI responded, but no text content was returned.";
+
+    res.json({ result });
   } catch (error) {
     console.error("OpenAI error:", error.message);
     res.status(500).json({
