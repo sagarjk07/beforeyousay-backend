@@ -42,7 +42,7 @@ app.post("/analyze", async (req, res) => {
     const { message, mode } = req.body;
 
     const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-5.4-nano",
       messages: [
         { role: "system", content: "You are BeforeYouSay AI." },
         { role: "user", content: getPrompt(mode, message) }
