@@ -200,7 +200,6 @@ app.post("/analyze", async (req, res) => {
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Message is required." });
     }
-
     if (message.trim().length > 1000) {
       return res.status(400).json({ error: "Message is too long. Please keep it under 1000 characters." });
     }
@@ -209,14 +208,15 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ error: "Valid mode is required." });
     }
 
-    if (!turnstileToken) {
-      return res.status(400).json({ error: "Verification is required." });
-    }
-
+  if (!turnstileToken || !String(turnstileToken).trim()) {
+  return res.status(400).json({ error: "Verification is required." });
+}
     if (!process.env.TURNSTILE_SECRET_KEY) {
       return res.status(500).json({ error: "Server verification is not configured." });
     }
-
+if (!process.env.TURNSTILE_SECRET_KEY) {
+  return res.status(500).json({ error: "Server verification is not configured." });
+}
     const formData = new URLSearchParams();
     formData.append("secret", process.env.TURNSTILE_SECRET_KEY);
     formData.append("response", turnstileToken);
