@@ -1,18 +1,17 @@
 const express = require("express");
+const cors = require("cors");
+const dotenv = require("dotenv");
+const OpenAI = require("openai");
+const rateLimit = require("express-rate-limit");
+dotenv.config();
+
+const app = express();
+
 const analyzeLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
   message: { error: "Too many requests. Please try again later." },
 });
-const cors = require("cors");
-const dotenv = require("dotenv");
-const OpenAI = require("openai");
-const rateLimit = require("express-rate-limit");
-
-dotenv.config();
-
-const app = express();
-
 app.use(cors({
   origin: ["https://beforeyousay.com", "http://localhost:3000"],
   methods: ["GET", "POST"],
