@@ -17,6 +17,33 @@ app.use(cors({
   origin: ["https://beforeyousay.com", "http://localhost:3000"],
   methods: ["GET", "POST"],
 }));
+/* ---------- Batch 8 Pro checkout: Stripe webhook ----------
+   Stripe posts payment events here. This route is registered BEFORE
+   express.json on purpose: the signature check needs the exact raw
+   body Stripe sent, and a JSON parser would change it. express.raw
+   hands us a Buffer; verifyStripeSignature (below) checks the
+   stripe-signature header against STRIPE_WEBHOOK_SECRET. A bad
+   signature, a stale timestamp, or a missing secret is refused —
+   nobody can fake a payment by posting to this URL. */
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) return res.status(503).send("Webhook is not set up on the server yet.");
+  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || "");
+  if (!verifyStripeSignature(raw, req.headers["stripe-signature"] || "", secret)) {
+    return res.status(400).send("Bad signature.");
+  }
+  let event;
+  try { event = JSON.parse(raw.toString("utf8")); } catch (e) { return res.status(400).send("Bad payload."); }
+  const change = planFromStripeEvent(event);
+  if (!change) return res.json({ received: true, ignored: true }); /* event type we do not act on */
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return res.status(503).send("Plan storage is not set up on the server yet.");
+  }
+  const saved = await supabaseAdminUpsertPlan(change.userId, change.plan);
+  if (!saved) return res.status(500).send("Could not save the plan change."); /* Stripe retries */
+  return res.json({ received: true, plan: change.plan });
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (req, res) => {
@@ -361,6 +388,167 @@ app.post("/delete-account", deleteLimiter, async (req, res) => {
   return res.json({ deleted: true, rowsDeleted: rowsDeleted, authUserDeleted: true });
 });
 
+/* ---------- Batch 8 Pro checkout: Stripe Checkout + plan changes ----------
+   Pro is sold through Stripe Checkout (test mode for now). Two pieces:
+   - POST /create-checkout-session: signed-in users only. Checks the
+     Supabase token the same way /delete-account does, then asks Stripe
+     for a Checkout session for the Monthly or Yearly price and returns
+     its URL. The frontend sends the user there; Stripe handles the card.
+   - The /stripe-webhook route above: Stripe tells us the payment
+     happened, and we set that user's profiles.plan to "pro" (or back
+     to "free" when the subscription ends). The plan is never trusted
+     from the frontend — only a signature-checked Stripe event changes it.
+   No new dependency: Stripe is called with plain fetch, the same way
+   Supabase and Turnstile already are. The price IDs below are public
+   identifiers (they appear in Checkout URLs), not secrets — but they
+   can be overridden with env vars, which is how the live prices will
+   be swapped in later without a code change. STRIPE_SECRET_KEY (test
+   key for now) and STRIPE_WEBHOOK_SECRET live on Render only, never
+   in code. No GST is collected: Stripe Tax is not enabled, and no tax
+   settings are sent with the session. */
+const STRIPE_PRICE_IDS = {
+  monthly: process.env.STRIPE_PRICE_MONTHLY || "price_1Ud7JPJAED4eiF02w6iDmDhP", /* test: AUD $5/month */
+  yearly: process.env.STRIPE_PRICE_YEARLY || "price_1Ud7JUJAED4eiF02V37Pv1tR", /* test: AUD $50/year */
+};
+const STRIPE_SITE_URL = "https://www.beforeyousay.com";
+
+function sanitiseBilling(input) {
+  return input === "monthly" || input === "yearly" ? input : null;
+}
+
+async function stripeApiPost(path, params) {
+  try {
+    const res = await fetch("https://api.stripe.com" + path, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + process.env.STRIPE_SECRET_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams(params),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await res.json().catch(function () { return null; });
+    return { ok: res.ok, status: res.status, data: data };
+  } catch (e) { return { ok: false, status: 0, data: null }; }
+}
+
+/* Stripe signs every webhook: header "t=<timestamp>,v1=<signature>".
+   The signature is HMAC-SHA256 of "<timestamp>.<raw body>" with the
+   webhook secret. We check the timestamp is fresh (5 minutes) and the
+   signature matches one of the v1 values, in constant time. */
+function verifyStripeSignature(rawBody, signatureHeader, secret) {
+  if (!secret || !signatureHeader) return false;
+  let ts = null;
+  const sigs = [];
+  String(signatureHeader).split(",").forEach(function (part) {
+    const p = part.trim();
+    if (p.indexOf("t=") === 0) ts = p.slice(2);
+    else if (p.indexOf("v1=") === 0) sigs.push(p.slice(3));
+  });
+  if (!ts || !sigs.length) return false;
+  const age = Math.abs(Date.now() / 1000 - Number(ts));
+  if (!Number.isFinite(age) || age > 300) return false; /* stale: replay */
+  const bodyText = Buffer.isBuffer(rawBody) ? rawBody.toString("utf8") : String(rawBody);
+  const expected = crypto.createHmac("sha256", secret).update(ts + "." + bodyText, "utf8").digest("hex");
+  return sigs.some(function (sig) {
+    try {
+      const a = Buffer.from(sig, "hex");
+      const b = Buffer.from(expected, "hex");
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (e) { return false; }
+  });
+}
+
+/* Pure mapping from a Stripe event to a plan change — nothing else in
+   the file needs to know Stripe's event shapes. Returns null for
+   events we ignore. The user id travels in metadata: the checkout
+   session carries it (metadata + client_reference_id), and the
+   subscription inherits it (subscription_data.metadata), so later
+   subscription events can find the same user. */
+function planFromStripeEvent(event) {
+  if (!event || typeof event.type !== "string") return null;
+  const data = event.data && event.data.object ? event.data.object : null;
+  if (!data) return null;
+  const userId = (data.metadata && data.metadata.user_id) || data.client_reference_id || null;
+  if (event.type === "checkout.session.completed") {
+    if (data.mode !== "subscription" || data.payment_status !== "paid") return null;
+    return userId ? { userId: userId, plan: "pro" } : null;
+  }
+  if (event.type === "customer.subscription.updated") {
+    if (!userId) return null;
+    if (data.status === "active" || data.status === "trialing") return { userId: userId, plan: "pro" };
+    if (data.status === "canceled" || data.status === "incomplete_expired") return { userId: userId, plan: "free" };
+    return null; /* past_due / unpaid / incomplete: Stripe retries payment; the plan stays until the subscription is actually cancelled */
+  }
+  if (event.type === "customer.subscription.deleted") {
+    return userId ? { userId: userId, plan: "free" } : null;
+  }
+  return null;
+}
+
+/* Upsert, not update: a user who goes straight from sign-up to checkout
+   may not have a profiles row yet (the row is normally made on first
+   sync). The row's other columns all have defaults or are nullable,
+   so id + plan is enough. Service-role key only — never the anon key. */
+async function supabaseAdminUpsertPlan(userId, plan) {
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/profiles", {
+      method: "POST",
+      headers: {
+        apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates",
+      },
+      body: JSON.stringify({ id: userId, plan: plan, updated_at: new Date().toISOString() }),
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+
+const checkoutLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: { error: "Too many checkout attempts. Please try again later." },
+});
+
+app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(503).json({ error: "Checkout is not set up on the server yet." });
+  }
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Sign-in is required to upgrade to Pro." });
+  }
+  const user = await getSupabaseUserFromToken(h.slice(7).trim());
+  if (!user) {
+    return res.status(401).json({ error: "Your sign-in could not be checked. Please sign in again and try." });
+  }
+  const billing = sanitiseBilling(req.body && req.body.billing);
+  if (!billing) {
+    return res.status(400).json({ error: "Choose Monthly or Yearly to upgrade to Pro." });
+  }
+  const priceId = STRIPE_PRICE_IDS[billing];
+  const result = await stripeApiPost("/v1/checkout/sessions", {
+    mode: "subscription",
+    "line_items[0][price]": priceId,
+    "line_items[0][quantity]": "1",
+    client_reference_id: user.id,
+    customer_email: user.email || "",
+    "metadata[user_id]": user.id,
+    "metadata[billing]": billing,
+    "subscription_data[metadata][user_id]": user.id,
+    success_url: STRIPE_SITE_URL + "/?checkout=success",
+    cancel_url: STRIPE_SITE_URL + "/?checkout=cancelled",
+  });
+  if (!result.ok || !result.data || !result.data.url) {
+    console.error("Stripe checkout error:", result.status, result.data && result.data.error ? result.data.error.message : "no response");
+    return res.status(502).json({ error: "Checkout could not be started. Please try again." });
+  }
+  return res.json({ url: result.data.url });
+});
+
 /* ---------- Batch 3 money: Free/Pro daily limit (signed-in users only) ----------
    Free: signed-in users get 10 checks a day. Guests cannot be counted
    server-side (no identity), so guests are limited only in the frontend
@@ -416,7 +604,7 @@ function todayRangeUTC(now) {
 }
 function limitErrorBody(limit, used) {
   return {
-    error: "You've used all " + limit + " of your free checks for today. Pro removes the limit \u2014 it's coming soon, and we're not taking payments yet. Your checks start again tomorrow.",
+    error: "You've used all " + limit + " of your free checks for today. Pro removes the limit \u2014 upgrade in Your account. Your checks start again tomorrow.",
     code: BYS_LIMIT_CODE, plan: "free", limit: limit, used: used,
   };
 }
