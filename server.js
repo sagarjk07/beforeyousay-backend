@@ -62,6 +62,31 @@ function toneProfileText(p) {
   if (p.defaultReplyStyle) bits.push(`Usual reply style: ${p.defaultReplyStyle}.`);
   return "\nUser's saved tone profile:\n" + bits.join(" ") + "\nMatch the rewrites to that tone, without changing the mode's job.";
 }
+/* ---------- Phase 1 contexts+styles: optional style + saved person ---------- */
+function sanitiseStyle(input) {
+  return ["shorter", "warmer", "firmer", "funnier"].includes(input) ? input : null;
+}
+function sanitiseContext(input) {
+  if (!input || typeof input !== "object") return null;
+  const name = typeof input.name === "string" ? input.name.trim().slice(0, 50) : "";
+  if (!name) return null;
+  const note = typeof input.note === "string" ? input.note.trim().slice(0, 200) : "";
+  return { name, note };
+}
+function contextText(c) {
+  if (!c) return "";
+  const note = c.note ? ` How the user wants to sound with them: ${c.note}.` : "";
+  return `\nThis message is for ${c.name}.${note} Adapt the rewrites to that relationship — the same words land differently with different people — without changing the mode's job.`;
+}
+function styleText(style) {
+  const styles = {
+    shorter: "\nRewrite style requested: SHORTER. Make better_version noticeably shorter and tighter than the original — cut filler, keep the meaning and the tone. Keep the other versions short too.",
+    warmer: "\nRewrite style requested: WARMER. Make better_version warmer and kinder, with more care in the wording, without sounding fake or over-the-top.",
+    firmer: "\nRewrite style requested: FIRMER. Make better_version firmer, more direct and more confident, without sounding rude or aggressive.",
+    funnier: "\nRewrite style requested: FUNNIER. Make better_version funnier and more playful, keeping it natural — never cringe, try-hard, or mean.",
+  };
+  return styles[style] || "";
+}
 function base64UrlDecode(s) { return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64"); }
 function verifySupabaseJwt(token) {
   const secret = process.env.SUPABASE_JWT_SECRET;
@@ -87,7 +112,7 @@ function optionalAuth(req, res, next) {
   return next();
 }
 
-function buildSystemPrompt(mode, toneProfile) {
+function buildSystemPrompt(mode, toneProfile, style, context) {
   const commonRules = `
 You are BeforeYouSay, an elite AI communication coach.
 
@@ -169,7 +194,7 @@ Avoid sounding needy, overexplaining, emotional, defensive, or weak.
 `,
   };
 
-  return `${commonRules}\n${modeGuidance[mode] || ""}${toneProfileText(toneProfile)}\n${outputFormat}`;
+  return `${commonRules}\n${modeGuidance[mode] || ""}${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}\n${outputFormat}`;
 }
 
 function formatFallback(mode, message, data) {
@@ -203,7 +228,7 @@ const limiter = rateLimit({
   max: 10,
   message: { error: "Too many requests. Please wait a minute and try again." },
 });
-function buildReplyPrompt(mode, toneProfile) {
+function buildReplyPrompt(mode, toneProfile, style, context) {
   const modeInstructions = {
     workplace: `You are helping someone reply professionally to a message they received at work. Replies must be calm, clear, and boundary-aware. No slang. Keep it respectful and concise.`,
     relationship: `You are helping someone reply in a relationship context to a message they received. Replies must be emotionally intelligent, honest, warm, and de-escalating. No blame or coldness.`,
@@ -249,7 +274,7 @@ Rules:
 - Replies must match the mode tone strictly — especially for rizz, be smooth and witty not polite.
 - Keep replies short and natural. No corporate speak. No over-explaining.
 - coach_note must be one punchy sentence of tactical advice.
-${toneProfileText(toneProfile)}
+${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}
 `;
 }
 app.use("/analyze", optionalAuth);
@@ -257,8 +282,10 @@ app.use("/analyze", limiter);
 
 app.post("/analyze", analyzeLimiter, async (req, res) => {
   try {
-    const { message, mode, turnstileToken, replyMode, toneProfile } = req.body;
+    const { message, mode, turnstileToken, replyMode, toneProfile, style, context } = req.body;
     const safeToneProfile = sanitiseToneProfile(toneProfile); // Phase 0: optional, ignored if missing/invalid
+    const safeStyle = sanitiseStyle(style); // Phase 1 contexts+styles: optional, ignored if missing/invalid
+    const safeContext = sanitiseContext(context); // Phase 1 contexts+styles: optional, ignored if missing/invalid
 
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Message is required." });
@@ -304,7 +331,7 @@ if (!process.env.TURNSTILE_SECRET_KEY) {
       response_format: { type: "json_object" },
       temperature: 0.8,
       messages: [
-       { role: "system", content: replyMode ? buildReplyPrompt(mode, safeToneProfile) : buildSystemPrompt(mode, safeToneProfile) },
+       { role: "system", content: replyMode ? buildReplyPrompt(mode, safeToneProfile, safeStyle, safeContext) : buildSystemPrompt(mode, safeToneProfile, safeStyle, safeContext) },
         {
           role: "user",
           content: `Analyze and improve this message:\n\n${message.trim()}`,
