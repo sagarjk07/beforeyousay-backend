@@ -277,6 +277,79 @@ Rules:
 ${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}
 `;
 }
+/* ---------- Batch 1 trust+control: delete my account ----------
+   POST /delete-account deletes a signed-in user's rows (profiles,
+   history, contexts) and then their Supabase auth user. It needs two
+   Render env vars, set on the Render dashboard only, never in code:
+   SUPABASE_URL (the Sydney project URL) and SUPABASE_SERVICE_ROLE_KEY.
+   The service-role key bypasses RLS, so it must never go in the
+   frontend, in Git, or in chat. If it is not set, the endpoint answers
+   503 and deletes nothing — the frontend still deletes the user's own
+   cloud rows directly (RLS lets each user delete only their own rows)
+   and says so plainly. The user's token is checked by asking Supabase
+   itself (GET /auth/v1/user with the service-role key), so no JWT
+   secret or HS256/ES256 check is needed here. Rate limited to 3
+   attempts per hour per IP. No token or key is ever logged. */
+const deleteLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  message: { error: "Too many delete requests. Please try again later." },
+});
+const SUPABASE_URL = (process.env.SUPABASE_URL || "https://vtupfkaaixqucymiggux.supabase.co").replace(/\/$/, "");
+async function supabaseAdminRequest(path, method) {
+  const res = await fetch(SUPABASE_URL + path, {
+    method: method,
+    headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY },
+  });
+  return res;
+}
+async function getSupabaseUserFromToken(token) {
+  try {
+    const res = await fetch(SUPABASE_URL + "/auth/v1/user", {
+      headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + token },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data && data.id ? data : null;
+  } catch (e) { return null; }
+}
+async function supabaseAdminDeleteRows(table, column, userId) {
+  try {
+    const res = await supabaseAdminRequest("/rest/v1/" + table + "?" + column + "=eq." + encodeURIComponent(userId), "DELETE");
+    return res.ok;
+  } catch (e) { return false; }
+}
+app.post("/delete-account", deleteLimiter, async (req, res) => {
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return res.status(503).json({ deleted: false, rowsDeleted: false, authUserDeleted: false, error: "Account deletion is not set up on the server yet." });
+  }
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) {
+    return res.status(401).json({ deleted: false, rowsDeleted: false, authUserDeleted: false, error: "Sign-in is required to delete an account." });
+  }
+  const user = await getSupabaseUserFromToken(h.slice(7).trim());
+  if (!user) {
+    return res.status(401).json({ deleted: false, rowsDeleted: false, authUserDeleted: false, error: "Your sign-in could not be checked. Please sign in again and try." });
+  }
+  const userId = user.id;
+  const rows = await Promise.all([
+    supabaseAdminDeleteRows("history", "user_id", userId),
+    supabaseAdminDeleteRows("contexts", "user_id", userId),
+    supabaseAdminDeleteRows("profiles", "id", userId),
+  ]);
+  const rowsDeleted = rows.every(Boolean);
+  let authUserDeleted = false;
+  try {
+    const delRes = await supabaseAdminRequest("/auth/v1/admin/users/" + encodeURIComponent(userId), "DELETE");
+    authUserDeleted = delRes.ok;
+  } catch (e) { authUserDeleted = false; }
+  if (!authUserDeleted) {
+    return res.status(200).json({ deleted: false, rowsDeleted: rowsDeleted, authUserDeleted: false, error: "Your data was deleted, but the sign-in account itself could not be removed. Please contact support and we will remove it." });
+  }
+  return res.json({ deleted: true, rowsDeleted: rowsDeleted, authUserDeleted: true });
+});
+
 app.use("/analyze", optionalAuth);
 app.use("/analyze", limiter);
 
