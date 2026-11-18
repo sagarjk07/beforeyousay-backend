@@ -33,6 +33,7 @@ app.get("/health", (req, res) => {
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+  timeout: 60000, /* Batch 4: a hung AI call fails after 60s instead of hanging forever */
 });
 
 /* ---------- Phase 0: optional Supabase sign-in (backwards compatible) ----------
@@ -135,6 +136,8 @@ Do not overexplain.
 Do not use emojis.
 Do not use quotation marks around rewrite suggestions unless needed.
 
+Keep the user's own words and phrasing wherever they already work — only change what needs changing. A rewrite that sounds like a different person is a bad rewrite, even if the grammar is perfect.
+
 Return valid JSON only.
 `;
 
@@ -166,9 +169,10 @@ Rules:
 - better_version must be the best final version for the chosen mode.
 - softer_version should feel gentler.
 - stronger_version should feel more direct/confident.
-- coach_note should be short and useful.
-- why_it_might_land_badly should explain how the message may be perceived.
+- coach_note should be short and useful: name the single riskiest phrase in the original message and give one concrete fix for it — never generic advice like "be clearer".
+- why_it_might_land_badly should explain how the message may be perceived, quoting the exact words that could land badly.
 - If the message is already strong, still improve it slightly.
+- Scores must match the text you just wrote: if the original is already clear and low-risk, scores are 8-10; if it is confusing or likely to upset the reader, effectiveness and emotional_control are 5 or below. Never give all four scores the same number.
 `;
 
   const modeGuidance = {
@@ -197,6 +201,12 @@ Avoid sounding needy, overexplaining, emotional, defensive, or weak.
   return `${commonRules}\n${modeGuidance[mode] || ""}${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}\n${outputFormat}`;
 }
 
+/* Batch 4: AI scores must be integers 1-10; a missing or out-of-range score falls back to 6, never 0 or 11. */
+function clampScoreOut(v) {
+  if (v === null || v === undefined || v === "") return 6; /* missing score */
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(10, Math.max(1, Math.round(n))) : 6;
+}
 function formatFallback(mode, message, data) {
   return {
     mode,
@@ -215,10 +225,10 @@ function formatFallback(mode, message, data) {
       data?.coach_note ||
       "Make the message clearer, calmer, and more intentional before sending.",
     scores: {
-      clarity: Number(data?.scores?.clarity) || 6,
-      confidence: Number(data?.scores?.confidence) || 6,
-      emotional_control: Number(data?.scores?.emotional_control) || 6,
-      effectiveness: Number(data?.scores?.effectiveness) || 6,
+      clarity: clampScoreOut(data?.scores?.clarity),
+      confidence: clampScoreOut(data?.scores?.confidence),
+      emotional_control: clampScoreOut(data?.scores?.emotional_control),
+      effectiveness: clampScoreOut(data?.scores?.effectiveness),
     },
   };
 }
@@ -261,11 +271,11 @@ Return valid JSON only in this exact structure:
   "softer_version": "string — a softer or warmer reply the user can send back",
   "stronger_version": "string — a more direct or assertive reply the user can send back",
   "coach_note": "string — one short tactical tip for this specific situation",
-  "risk_level": "low",
-  "should_send": "yes",
+  "risk_level": "low | medium | high — judge the received message, never leave it fixed",
+  "should_send": "yes | edit_first | no — judge whether the best reply is safe to send as written",
   "intent_guess": "string — what the sender likely meant",
   "original_message": "",
-  "scores": { "clarity": 8, "confidence": 8, "emotional_control": 8, "effectiveness": 8 }
+  "scores": { "clarity": 0, "confidence": 0, "emotional_control": 0, "effectiveness": 0 }
 }
 
 Rules:
@@ -274,6 +284,7 @@ Rules:
 - Replies must match the mode tone strictly — especially for rizz, be smooth and witty not polite.
 - Keep replies short and natural. No corporate speak. No over-explaining.
 - coach_note must be one punchy sentence of tactical advice.
+- Judge risk_level, should_send and the four scores from the received message and your replies — never leave them at fixed values. Scores are integers 1-10 and must differ where the reply's qualities differ.
 ${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}
 `;
 }
@@ -368,6 +379,32 @@ app.post("/delete-account", deleteLimiter, async (req, res) => {
    day, so near midnight the two can differ by one check — the backend
    is the enforcer for signed-in users, the frontend is the friendly guide.
    No Stripe, no payments, no new dependency. */
+/* ---------- Batch 4 quality+speed: identical-check cache ----------
+   The same message + mode + tone + person + style asked twice within
+   10 minutes gets the same result without a second OpenAI call — faster
+   for the user and cheaper per check. Only successful results are cached,
+   never errors or limit responses. The cache lives in memory only (up to
+   100 entries, oldest dropped first), so a Render restart simply empties
+   it — nothing is stored on disk and no user data leaves the server.
+   The cache is checked AFTER the daily-limit check and AFTER Turnstile,
+   so a user at their limit still gets the limit message, and the cache
+   can never be used to skip verification. Response shape is unchanged. */
+const ANALYZE_CACHE_TTL_MS = 10 * 60 * 1000;
+const ANALYZE_CACHE_MAX = 100;
+const analyzeCache = new Map();
+function analyzeCacheKey(parts) {
+  return crypto.createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+function analyzeCacheGet(key) {
+  const hit = analyzeCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > ANALYZE_CACHE_TTL_MS) { analyzeCache.delete(key); return null; }
+  return hit.data;
+}
+function analyzeCacheSet(key, data) {
+  if (analyzeCache.size >= ANALYZE_CACHE_MAX) analyzeCache.delete(analyzeCache.keys().next().value);
+  analyzeCache.set(key, { at: Date.now(), data: data });
+}
 const FREE_SIGNED_IN_DAILY_LIMIT = 10;
 const BYS_LIMIT_CODE = "daily_limit";
 function isProPlan(plan) { return plan === "pro"; }
@@ -403,19 +440,25 @@ async function checkSignedInDailyLimit(req) {
   if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return { blocked: false }; /* fail open */
   const user = await getSupabaseUserFromToken(h.slice(7).trim());
   if (!user) return { blocked: false }; /* fail open: bad token is already ignored by optionalAuth */
-  try {
-    const planRes = await fetch(SUPABASE_URL + "/rest/v1/profiles?select=plan&id=eq." + encodeURIComponent(user.id), {
-      headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (planRes.ok) {
-      const rows = await planRes.json();
-      if (Array.isArray(rows) && rows[0] && isProPlan(rows[0].plan)) return { blocked: false };
-    }
-    /* Plan lookup failed (no plan column yet) — treat as Free and keep
-       going; never block on a lookup failure. */
-  } catch (e) { /* fall through to the count check */ }
-  const used = await supabaseCountToday(user.id);
+  /* Batch 4: the plan lookup and the today-count are independent, so
+     they now run in parallel instead of one after the other — one fewer
+     Supabase round trip before every signed-in check. Either failing
+     still fails open (see below); a Pro plan still skips the limit. */
+  const [plan, used] = await Promise.all([
+    (async () => {
+      try {
+        const planRes = await fetch(SUPABASE_URL + "/rest/v1/profiles?select=plan&id=eq." + encodeURIComponent(user.id), {
+          headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!planRes.ok) return null; /* no plan column yet — treat as Free */
+        const rows = await planRes.json();
+        return Array.isArray(rows) && rows[0] ? rows[0].plan : null;
+      } catch (e) { return null; /* fail open */ }
+    })(),
+    supabaseCountToday(user.id),
+  ]);
+  if (isProPlan(plan)) return { blocked: false };
   if (used === null) return { blocked: false }; /* fail open */
   if (used >= FREE_SIGNED_IN_DAILY_LIMIT) return { blocked: true, body: limitErrorBody(FREE_SIGNED_IN_DAILY_LIMIT, used) };
   return { blocked: false };
@@ -453,9 +496,6 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
     if (!process.env.TURNSTILE_SECRET_KEY) {
       return res.status(500).json({ error: "Server verification is not configured." });
     }
-if (!process.env.TURNSTILE_SECRET_KEY) {
-  return res.status(500).json({ error: "Server verification is not configured." });
-}
     const formData = new URLSearchParams();
     formData.append("secret", process.env.TURNSTILE_SECRET_KEY);
     formData.append("response", turnstileToken);
@@ -463,6 +503,7 @@ if (!process.env.TURNSTILE_SECRET_KEY) {
     const turnstileResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
       method: "POST",
       body: formData,
+      signal: AbortSignal.timeout(10000), /* Batch 4: never hang on verification */
     });
 
     const turnstileResult = await turnstileResponse.json();
@@ -475,10 +516,15 @@ if (!process.env.TURNSTILE_SECRET_KEY) {
       return res.status(500).json({ error: "AI service is not configured." });
     }
 
+    /* Batch 4: identical check within 10 minutes — serve the cached result instead of a second AI call. */
+    const cacheKey = analyzeCacheKey({ message: message.trim(), mode, replyMode: Boolean(replyMode), toneProfile: safeToneProfile, style: safeStyle, context: safeContext });
+    const cached = analyzeCacheGet(cacheKey);
+    if (cached) return res.json(cached);
+
     const response = await client.chat.completions.create({
       model: "gpt-5.4-nano",
       response_format: { type: "json_object" },
-      temperature: 0.8,
+      temperature: 0.7, /* Batch 4: was 0.8 — slightly steadier scores and JSON, same model */
       messages: [
        { role: "system", content: replyMode ? buildReplyPrompt(mode, safeToneProfile, safeStyle, safeContext) : buildSystemPrompt(mode, safeToneProfile, safeStyle, safeContext) },
         {
@@ -504,6 +550,7 @@ if (!process.env.TURNSTILE_SECRET_KEY) {
     }
 
     const finalData = formatFallback(mode, message.trim(), parsed);
+    analyzeCacheSet(cacheKey, finalData);
 
     res.json(finalData);
   } catch (error) {
