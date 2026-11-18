@@ -350,6 +350,76 @@ app.post("/delete-account", deleteLimiter, async (req, res) => {
   return res.json({ deleted: true, rowsDeleted: rowsDeleted, authUserDeleted: true });
 });
 
+/* ---------- Batch 3 money: Free/Pro daily limit (signed-in users only) ----------
+   Free: signed-in users get 10 checks a day. Guests cannot be counted
+   server-side (no identity), so guests are limited only in the frontend
+   (5 a day, from localStorage history) — see index.html.
+   Pro: unlimited. The plan is read from the profiles row only if it has
+   a "plan" column; there is no such column today, so the plan lookup
+   fails and everyone is treated as Free. A future migration adds the
+   column and this code starts honouring it with no change.
+   Counting: today's history rows for that user, via Supabase REST with
+   the service-role key already on Render (same env vars as
+   /delete-account). Fail open, always: if the token cannot be checked,
+   the plan cannot be read, or the count cannot be read, the check runs
+   — a lookup failure must never block a real user. The limit is checked
+   BEFORE Turnstile, so a user at the limit never burns a Turnstile token.
+   "Today" here is a UTC day; the frontend counts by the user's local
+   day, so near midnight the two can differ by one check — the backend
+   is the enforcer for signed-in users, the frontend is the friendly guide.
+   No Stripe, no payments, no new dependency. */
+const FREE_SIGNED_IN_DAILY_LIMIT = 10;
+const BYS_LIMIT_CODE = "daily_limit";
+function isProPlan(plan) { return plan === "pro"; }
+function todayRangeUTC(now) {
+  const d = new Date(now);
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const end = new Date(start); end.setUTCDate(end.getUTCDate() + 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+function limitErrorBody(limit, used) {
+  return {
+    error: "You've used all " + limit + " of your free checks for today. Pro removes the limit \u2014 it's coming soon, and we're not taking payments yet. Your checks start again tomorrow.",
+    code: BYS_LIMIT_CODE, plan: "free", limit: limit, used: used,
+  };
+}
+async function supabaseCountToday(userId) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null; /* fail open: no key, no enforcement */
+  const range = todayRangeUTC(new Date());
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/history?select=id&user_id=eq." + encodeURIComponent(userId) + "&created_at=gte." + encodeURIComponent(range.start) + "&created_at=lt." + encodeURIComponent(range.end) + "&limit=" + (FREE_SIGNED_IN_DAILY_LIMIT + 1), {
+      headers: { apikey: key, Authorization: "Bearer " + key, Prefer: "count=exact" },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null; /* fail open */
+    const rows = await res.json();
+    return Array.isArray(rows) ? rows.length : null;
+  } catch (e) { return null; /* fail open: a lookup failure never blocks a check */ }
+}
+async function checkSignedInDailyLimit(req) {
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) return { blocked: false }; /* guest: frontend limit only */
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return { blocked: false }; /* fail open */
+  const user = await getSupabaseUserFromToken(h.slice(7).trim());
+  if (!user) return { blocked: false }; /* fail open: bad token is already ignored by optionalAuth */
+  try {
+    const planRes = await fetch(SUPABASE_URL + "/rest/v1/profiles?select=plan&id=eq." + encodeURIComponent(user.id), {
+      headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (planRes.ok) {
+      const rows = await planRes.json();
+      if (Array.isArray(rows) && rows[0] && isProPlan(rows[0].plan)) return { blocked: false };
+    }
+    /* Plan lookup failed (no plan column yet) — treat as Free and keep
+       going; never block on a lookup failure. */
+  } catch (e) { /* fall through to the count check */ }
+  const used = await supabaseCountToday(user.id);
+  if (used === null) return { blocked: false }; /* fail open */
+  if (used >= FREE_SIGNED_IN_DAILY_LIMIT) return { blocked: true, body: limitErrorBody(FREE_SIGNED_IN_DAILY_LIMIT, used) };
+  return { blocked: false };
+}
 app.use("/analyze", optionalAuth);
 app.use("/analyze", limiter);
 
@@ -369,6 +439,12 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
 
     if (!mode || !["workplace", "relationship", "rizz", "negotiation"].includes(mode)) {
       return res.status(400).json({ error: "Valid mode is required." });
+    }
+
+    /* Batch 3 money: signed-in daily limit, checked before Turnstile so a user at the limit never burns a token. Fail open — see checkSignedInDailyLimit. */
+    const limitCheck = await checkSignedInDailyLimit(req);
+    if (limitCheck.blocked) {
+      return res.status(429).json(limitCheck.body);
     }
 
   if (!turnstileToken || !String(turnstileToken).trim()) {
