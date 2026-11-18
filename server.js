@@ -492,7 +492,7 @@ function planFromStripeEvent(event) {
    so id + plan is enough. Service-role key only — never the anon key. */
 async function supabaseAdminUpsertPlan(userId, plan) {
   try {
-    const res = await fetch(SUPABASE_URL + "/rest/v1/profiles", {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/profiles?on_conflict=id", {
       method: "POST",
       headers: {
         apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -503,8 +503,14 @@ async function supabaseAdminUpsertPlan(userId, plan) {
       body: JSON.stringify({ id: userId, plan: plan, updated_at: new Date().toISOString() }),
       signal: AbortSignal.timeout(5000),
     });
-    return res.ok;
-  } catch (e) { return false; }
+    if (!res.ok) {
+      let body = "";
+      try { body = await res.text(); } catch (e2) { body = ""; }
+      console.error("Supabase plan upsert failed:", res.status, body);
+      return false;
+    }
+    return true;
+  } catch (e) { console.error("Supabase plan upsert error:", e && e.message ? e.message : e); return false; }
 }
 
 const checkoutLimiter = rateLimit({
