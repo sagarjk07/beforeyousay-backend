@@ -7,6 +7,7 @@ const crypto = require("crypto"); // Phase 0: only used for optional Supabase JW
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1); /* Batch 9: Render forwards X-Forwarded-For - trust one proxy hop so express-rate-limit keys by the real user IP, not the proxy IP (was: every user shared one rate-limit bucket, plus ERR_ERL_UNEXPECTED_X_FORWARDED_FOR warnings). */
 
 const analyzeLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
