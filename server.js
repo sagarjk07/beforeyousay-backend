@@ -3,6 +3,7 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const OpenAI = require("openai");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto"); // Phase 0: only used for optional Supabase JWT checks — no new dependency.
 dotenv.config();
 
 const app = express();
@@ -34,7 +35,59 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-function buildSystemPrompt(mode) {
+/* ---------- Phase 0: optional Supabase sign-in (backwards compatible) ----------
+   - If no Authorization header is sent, or SUPABASE_JWT_SECRET is not set,
+     this does nothing and the site works exactly as today (anonymous).
+   - If a Bearer token IS sent and SUPABASE_JWT_SECRET IS set, we check the
+     token is a real Supabase JWT signed with that secret (HS256). A bad or
+     expired token is ignored — the request still runs anonymously.
+   - Nothing in the /analyze response changes. req.authUser is only used
+     later, when cloud history is switched on. No token is ever logged.
+   - Note: newer Supabase projects sign tokens with ES256 / JWKS instead of
+     HS256. If yours does, leave SUPABASE_JWT_SECRET unset for now — Phase 0
+     still works — and add JWKS checking in Phase 1. */
+function sanitiseToneProfile(input) {
+  if (!input || typeof input !== "object") return null;
+  const clean = (v) => (typeof v === "string" ? v.trim().slice(0, 80) : "");
+  const num = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.min(5, Math.max(1, Math.round(n))) : 3; };
+  const mode = ["workplace", "relationship", "rizz", "negotiation"].includes(input.defaultMode) ? input.defaultMode : null;
+  const reply = ["balanced", "calm", "assertive", "warm"].includes(input.defaultReplyStyle) ? input.defaultReplyStyle : null;
+  return { name: clean(input.name), directness: num(input.directness), warmth: num(input.warmth), formality: num(input.formality), playfulness: num(input.playfulness), defaultMode: mode, defaultReplyStyle: reply };
+}
+function toneProfileText(p) {
+  if (!p) return "";
+  const bits = [];
+  if (p.name) bits.push(`The user is called ${p.name}.`);
+  bits.push(`Saved tone (1 = low, 5 = high): directness ${p.directness}/5, warmth ${p.warmth}/5, formality ${p.formality}/5, playfulness ${p.playfulness}/5.`);
+  if (p.defaultReplyStyle) bits.push(`Usual reply style: ${p.defaultReplyStyle}.`);
+  return "\nUser's saved tone profile:\n" + bits.join(" ") + "\nMatch the rewrites to that tone, without changing the mode's job.";
+}
+function base64UrlDecode(s) { return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64"); }
+function verifySupabaseJwt(token) {
+  const secret = process.env.SUPABASE_JWT_SECRET;
+  if (!secret) return null;
+  const parts = String(token).split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const header = JSON.parse(base64UrlDecode(parts[0]).toString("utf8"));
+    if (header.alg !== "HS256") return null; // ES256/JWKS tokens are left for Phase 1
+    const expected = crypto.createHmac("sha256", secret).update(parts[0] + "." + parts[1]).digest();
+    const actual = base64UrlDecode(parts[2]);
+    if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) return null;
+    const payload = JSON.parse(base64UrlDecode(parts[1]).toString("utf8"));
+    if (payload.exp && payload.exp * 1000 < Date.now()) return null;
+    return { id: payload.sub || null, email: payload.email || null };
+  } catch (e) { return null; }
+}
+function optionalAuth(req, res, next) {
+  req.authUser = null;
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) return next();
+  req.authUser = verifySupabaseJwt(h.slice(7).trim());
+  return next();
+}
+
+function buildSystemPrompt(mode, toneProfile) {
   const commonRules = `
 You are BeforeYouSay, an elite AI communication coach.
 
@@ -116,7 +169,7 @@ Avoid sounding needy, overexplaining, emotional, defensive, or weak.
 `,
   };
 
-  return `${commonRules}\n${modeGuidance[mode] || ""}\n${outputFormat}`;
+  return `${commonRules}\n${modeGuidance[mode] || ""}${toneProfileText(toneProfile)}\n${outputFormat}`;
 }
 
 function formatFallback(mode, message, data) {
@@ -150,7 +203,7 @@ const limiter = rateLimit({
   max: 10,
   message: { error: "Too many requests. Please wait a minute and try again." },
 });
-function buildReplyPrompt(mode) {
+function buildReplyPrompt(mode, toneProfile) {
   const modeInstructions = {
     workplace: `You are helping someone reply professionally to a message they received at work. Replies must be calm, clear, and boundary-aware. No slang. Keep it respectful and concise.`,
     relationship: `You are helping someone reply in a relationship context to a message they received. Replies must be emotionally intelligent, honest, warm, and de-escalating. No blame or coldness.`,
@@ -196,13 +249,16 @@ Rules:
 - Replies must match the mode tone strictly — especially for rizz, be smooth and witty not polite.
 - Keep replies short and natural. No corporate speak. No over-explaining.
 - coach_note must be one punchy sentence of tactical advice.
+${toneProfileText(toneProfile)}
 `;
 }
+app.use("/analyze", optionalAuth);
 app.use("/analyze", limiter);
 
 app.post("/analyze", analyzeLimiter, async (req, res) => {
   try {
-    const { message, mode, turnstileToken, replyMode } = req.body;
+    const { message, mode, turnstileToken, replyMode, toneProfile } = req.body;
+    const safeToneProfile = sanitiseToneProfile(toneProfile); // Phase 0: optional, ignored if missing/invalid
 
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Message is required." });
@@ -248,7 +304,7 @@ if (!process.env.TURNSTILE_SECRET_KEY) {
       response_format: { type: "json_object" },
       temperature: 0.8,
       messages: [
-       { role: "system", content: replyMode ? buildReplyPrompt(mode) : buildSystemPrompt(mode) },
+       { role: "system", content: replyMode ? buildReplyPrompt(mode, safeToneProfile) : buildSystemPrompt(mode, safeToneProfile) },
         {
           role: "user",
           content: `Analyze and improve this message:\n\n${message.trim()}`,
