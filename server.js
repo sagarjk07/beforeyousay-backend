@@ -606,7 +606,11 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     "metadata[user_id]": user.id,
     "metadata[billing]": billing,
     "subscription_data[metadata][user_id]": user.id,
-    success_url: STRIPE_SITE_URL + "/?checkout=success",
+    /* Batch 12: the return URL carries the Checkout session id, so
+       the site can look the payment up when Stripe sends the user back
+       and say plainly which account paid. Stripe replaces
+       {CHECKOUT_SESSION_ID} with the real session id. */
+    success_url: STRIPE_SITE_URL + "/?checkout=success&session_id={CHECKOUT_SESSION_ID}",
     cancel_url: STRIPE_SITE_URL + "/?checkout=cancelled",
   });
   if (!result.ok || !result.data || !result.data.url) {
@@ -614,6 +618,61 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     return res.status(502).json({ error: "Checkout could not be started. Please try again." });
   }
   return res.json({ url: result.data.url });
+});
+
+/* ---------- Batch 12 Stripe return fix ----------
+   After paying, Stripe sends the user back to /?checkout=success —
+   and twice now (test mode, then the live $5 payment) Sagar landed
+   back signed out, feeling locked out. The payment itself was fine
+   both times (the webhook had already flipped the plan to Pro), but
+   the site could not say WHO had just paid, so a user who signs back
+   in as the wrong account sees Free and thinks the payment vanished.
+   Fix: the success_url now carries the Checkout session id, and this
+   lookup endpoint lets the site ask Stripe who paid.
+   GET /checkout-session?session_id=cs_... — no sign-in required (the
+   user is signed out at exactly this moment). It fetches that session
+   from Stripe and returns ONLY the paying customer's email and the
+   current plan for the user id in the session metadata (looked up with
+   the service-role key, the same way the webhook does). It never
+   returns keys, tokens, full customer records or other users' data.
+   A session that is not a paid subscription, or has no user id or
+   email, is a 404 — the same as an unknown id. Rate limited to 10
+   lookups per hour per IP, like checkout. No token or key is ever
+   logged. */
+function checkoutSessionDetails(session) {
+  if (!session || typeof session !== "object") return null;
+  if (session.mode !== "subscription" || session.payment_status !== "paid") return null;
+  const userId = (session.metadata && session.metadata.user_id) || session.client_reference_id || null;
+  if (!userId) return null;
+  const email = (session.customer_details && session.customer_details.email) || session.customer_email || null;
+  if (!email) return null;
+  return { userId: userId, email: email };
+}
+const checkoutLookupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: { error: "Too many payment lookups. Please try again later." },
+});
+app.get("/checkout-session", checkoutLookupLimiter, async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(503).json({ error: "Checkout lookup is not set up on the server yet." });
+  }
+  const sessionId = typeof req.query.session_id === "string" ? req.query.session_id.trim() : "";
+  if (!sessionId || sessionId.indexOf("cs_") !== 0) {
+    return res.status(400).json({ error: "That payment link doesn't look right. Sign in and check Your account — your Pro will show there if the payment went through." });
+  }
+  const got = await stripeApiGet("/v1/checkout/sessions/" + encodeURIComponent(sessionId));
+  if (!got.ok || !got.data || !got.data.id) {
+    if (got.status === 404) return res.status(404).json({ error: "We couldn't find that payment. If you paid, sign in and check Your account — your Pro will show there." });
+    console.error("Stripe checkout session lookup error:", got.status);
+    return res.status(502).json({ error: "We couldn't check that payment right now. Sign in and check Your account — your Pro will show there if the payment went through." });
+  }
+  const details = checkoutSessionDetails(got.data);
+  if (!details) {
+    return res.status(404).json({ error: "We couldn't find that payment. If you paid, sign in and check Your account — your Pro will show there." });
+  }
+  const profile = await supabaseAdminGetProfile(details.userId);
+  return res.json({ email: details.email, plan: profile && profile.plan ? profile.plan : "free" });
 });
 
 /* ---------- Batch 11 self-serve cancel ----------
