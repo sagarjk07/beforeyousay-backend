@@ -40,7 +40,12 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
   if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
     return res.status(503).send("Plan storage is not set up on the server yet.");
   }
-  const saved = await supabaseAdminUpsertPlan(change.userId, change.plan);
+  /* Batch 11: the change now carries the Stripe customer/subscription ids and the period end, so the profile row knows which subscription to cancel later. Fields set to undefined are left alone; null clears a column (see supabaseAdminUpsertProfileFields). */
+  const fields = { plan: change.plan };
+  if (change.stripeCustomerId !== undefined) fields.stripe_customer_id = change.stripeCustomerId;
+  if (change.stripeSubscriptionId !== undefined) fields.stripe_subscription_id = change.stripeSubscriptionId;
+  if (change.planEndsAt !== undefined) fields.plan_ends_at = change.planEndsAt;
+  const saved = await supabaseAdminUpsertProfileFields(change.userId, fields);
   if (!saved) return res.status(500).send("Could not save the plan change."); /* Stripe retries */
   return res.json({ received: true, plan: change.plan });
 });
@@ -433,6 +438,19 @@ async function stripeApiPost(path, params) {
   } catch (e) { return { ok: false, status: 0, data: null }; }
 }
 
+/* Batch 11: Stripe GET (subscription lookup + subscription search for
+   /cancel-subscription). Same shape as stripeApiPost, minus the body. */
+async function stripeApiGet(path) {
+  try {
+    const res = await fetch("https://api.stripe.com" + path, {
+      headers: { Authorization: "Bearer " + process.env.STRIPE_SECRET_KEY },
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await res.json().catch(function () { return null; });
+    return { ok: res.ok, status: res.status, data: data };
+  } catch (e) { return { ok: false, status: 0, data: null }; }
+}
+
 /* Stripe signs every webhook: header "t=<timestamp>,v1=<signature>".
    The signature is HMAC-SHA256 of "<timestamp>.<raw body>" with the
    webhook secret. We check the timestamp is fresh (5 minutes) and the
@@ -465,7 +483,25 @@ function verifyStripeSignature(rawBody, signatureHeader, secret) {
    events we ignore. The user id travels in metadata: the checkout
    session carries it (metadata + client_reference_id), and the
    subscription inherits it (subscription_data.metadata), so later
-   subscription events can find the same user. */
+   subscription events can find the same user.
+   Batch 11: the result also carries the Stripe customer id, the
+   subscription id and the period end, so the webhook can store them
+   on the profile row and /cancel-subscription can find the
+   subscription later. planEndsAt is an ISO string to set, null to
+   clear the column (subscription gone), or undefined to leave it
+   alone (the event says nothing about the period end). */
+function stripePeriodEndIso(sub) {
+  const ts = sub && typeof sub.current_period_end === "number" ? sub.current_period_end : null;
+  if (!ts) return undefined;
+  const d = new Date(ts * 1000);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : undefined;
+}
+function stripeCustomerIdOf(sub) {
+  if (!sub) return undefined;
+  if (typeof sub.customer === "string") return sub.customer;
+  if (sub.customer && typeof sub.customer.id === "string") return sub.customer.id;
+  return undefined;
+}
 function planFromStripeEvent(event) {
   if (!event || typeof event.type !== "string") return null;
   const data = event.data && event.data.object ? event.data.object : null;
@@ -473,16 +509,26 @@ function planFromStripeEvent(event) {
   const userId = (data.metadata && data.metadata.user_id) || data.client_reference_id || null;
   if (event.type === "checkout.session.completed") {
     if (data.mode !== "subscription" || data.payment_status !== "paid") return null;
-    return userId ? { userId: userId, plan: "pro" } : null;
+    /* The period end is not on the session — the subscription.created
+       event that follows carries it, so leave plan_ends_at alone here. */
+    return userId ? { userId: userId, plan: "pro", stripeCustomerId: typeof data.customer === "string" ? data.customer : undefined, stripeSubscriptionId: typeof data.subscription === "string" ? data.subscription : undefined, planEndsAt: undefined } : null;
+  }
+  if (event.type === "customer.subscription.created") {
+    if (!userId) return null;
+    if (data.status === "active" || data.status === "trialing") return { userId: userId, plan: "pro", stripeCustomerId: stripeCustomerIdOf(data), stripeSubscriptionId: typeof data.id === "string" ? data.id : undefined, planEndsAt: stripePeriodEndIso(data) };
+    return null;
   }
   if (event.type === "customer.subscription.updated") {
     if (!userId) return null;
-    if (data.status === "active" || data.status === "trialing") return { userId: userId, plan: "pro" };
-    if (data.status === "canceled" || data.status === "incomplete_expired") return { userId: userId, plan: "free" };
+    /* Cancel-at-period-end lands here: status stays "active", so the
+       plan stays "pro" — but the period end is now the date Pro runs
+       out, and the site shows "Pro until <date>". */
+    if (data.status === "active" || data.status === "trialing") return { userId: userId, plan: "pro", stripeCustomerId: stripeCustomerIdOf(data), stripeSubscriptionId: typeof data.id === "string" ? data.id : undefined, planEndsAt: stripePeriodEndIso(data) };
+    if (data.status === "canceled" || data.status === "incomplete_expired") return { userId: userId, plan: "free", stripeCustomerId: stripeCustomerIdOf(data), stripeSubscriptionId: null, planEndsAt: null };
     return null; /* past_due / unpaid / incomplete: Stripe retries payment; the plan stays until the subscription is actually cancelled */
   }
   if (event.type === "customer.subscription.deleted") {
-    return userId ? { userId: userId, plan: "free" } : null;
+    return userId ? { userId: userId, plan: "free", stripeCustomerId: stripeCustomerIdOf(data), stripeSubscriptionId: null, planEndsAt: null } : null;
   }
   return null;
 }
@@ -491,7 +537,18 @@ function planFromStripeEvent(event) {
    may not have a profiles row yet (the row is normally made on first
    sync). The row's other columns all have defaults or are nullable,
    so id + plan is enough. Service-role key only — never the anon key. */
-async function supabaseAdminUpsertPlan(userId, plan) {
+/* Upsert, not update: a user who goes straight from sign-up to checkout
+   may not have a profiles row yet (the row is normally made on first
+   sync). The row's other columns all have defaults or are nullable,
+   so id + plan is enough. Service-role key only — never the anon key.
+   Batch 11: the general version upserts any profile fields (plan,
+   stripe ids, period end). A field set to undefined is left out of
+   the body, so an event that says nothing about it cannot wipe a
+   value another event stored; a field set to null IS sent, which
+   clears that column (used when a subscription is deleted). */
+async function supabaseAdminUpsertProfileFields(userId, fields) {
+  const body = { id: userId, updated_at: new Date().toISOString() };
+  Object.keys(fields || {}).forEach(function (k) { if (fields[k] !== undefined) body[k] = fields[k]; });
   try {
     const res = await fetch(SUPABASE_URL + "/rest/v1/profiles?on_conflict=id", {
       method: "POST",
@@ -501,17 +558,20 @@ async function supabaseAdminUpsertPlan(userId, plan) {
         "Content-Type": "application/json",
         Prefer: "resolution=merge-duplicates",
       },
-      body: JSON.stringify({ id: userId, plan: plan, updated_at: new Date().toISOString() }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) {
-      let body = "";
-      try { body = await res.text(); } catch (e2) { body = ""; }
-      console.error("Supabase plan upsert failed:", res.status, body);
+      let bodyText = "";
+      try { bodyText = await res.text(); } catch (e2) { bodyText = ""; }
+      console.error("Supabase profile upsert failed:", res.status, bodyText);
       return false;
     }
     return true;
-  } catch (e) { console.error("Supabase plan upsert error:", e && e.message ? e.message : e); return false; }
+  } catch (e) { console.error("Supabase profile upsert error:", e && e.message ? e.message : e); return false; }
+}
+async function supabaseAdminUpsertPlan(userId, plan) {
+  return supabaseAdminUpsertProfileFields(userId, { plan: plan });
 }
 
 const checkoutLimiter = rateLimit({
@@ -554,6 +614,114 @@ app.post("/create-checkout-session", checkoutLimiter, async (req, res) => {
     return res.status(502).json({ error: "Checkout could not be started. Please try again." });
   }
   return res.json({ url: result.data.url });
+});
+
+/* ---------- Batch 11 self-serve cancel ----------
+   POST /cancel-subscription lets a signed-in Pro user cancel Pro
+   themselves. Policy (Sagar's choice): the subscription is cancelled
+   at the end of the paid period (cancel_at_period_end) — the user
+   keeps Pro until then, then drops to Free automatically when Stripe
+   ends the subscription. No automatic refund; refunds are on request
+   by email (see the site's refund note).
+   Finding the subscription: the profile row normally carries the
+   Stripe subscription id (the webhook stores it on every payment
+   event). Users who paid before Batch 11 have no id stored, so the
+   endpoint falls back to a Stripe search by the user id in the
+   subscription metadata — and backfills the row when it finds one.
+   Safety: the subscription's own metadata user_id must match the
+   signed-in user before anything is cancelled, so a tampered or
+   stale profile row can never cancel someone else's Pro. Rate
+   limited to 10 attempts per hour per IP, like checkout. No token
+   or key is ever logged. */
+const cancelLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: { error: "Too many cancellation attempts. Please try again later." },
+});
+async function supabaseAdminGetProfile(userId) {
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/profiles?select=plan,stripe_customer_id,stripe_subscription_id,plan_ends_at&id=eq." + encodeURIComponent(userId), {
+      headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (e) { return null; }
+}
+async function stripeFindSubscriptionByUserId(userId) {
+  const query = "metadata['user_id']:'" + userId + "'";
+  const result = await stripeApiGet("/v1/subscriptions/search?query=" + encodeURIComponent(query) + "&limit=10");
+  if (!result.ok || !result.data || !Array.isArray(result.data.data)) return { found: null, error: !result.ok };
+  const live = result.data.data.filter(function (s) { return s.status === "active" || s.status === "trialing"; });
+  return { found: live[0] || null, error: false };
+}
+const NO_SUBSCRIPTION_MESSAGE = "No active Pro subscription was found on your account. If you paid and think this is wrong, email us and we'll sort it out.";
+app.post("/cancel-subscription", cancelLimiter, async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(503).json({ error: "Cancellation is not set up on the server yet." });
+  }
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Sign-in is required to cancel Pro." });
+  }
+  const user = await getSupabaseUserFromToken(h.slice(7).trim());
+  if (!user) {
+    return res.status(401).json({ error: "Your sign-in could not be checked. Please sign in again and try." });
+  }
+  let subId = null;
+  let sub = null;
+  const profile = await supabaseAdminGetProfile(user.id);
+  if (profile && profile.stripe_subscription_id) subId = profile.stripe_subscription_id;
+  if (!subId) {
+    const found = await stripeFindSubscriptionByUserId(user.id);
+    if (found.error) {
+      console.error("Stripe subscription search error");
+      return res.status(502).json({ error: "Cancellation couldn't be completed. Please try again." });
+    }
+    if (found.found) {
+      sub = found.found;
+      subId = sub.id;
+      /* Backfill the row so the next cancel finds it straight away. */
+      await supabaseAdminUpsertProfileFields(user.id, { stripe_customer_id: stripeCustomerIdOf(sub) || null, stripe_subscription_id: sub.id, plan_ends_at: stripePeriodEndIso(sub) });
+    }
+  }
+  if (!subId) {
+    return res.status(404).json({ error: NO_SUBSCRIPTION_MESSAGE });
+  }
+  if (!sub) {
+    const got = await stripeApiGet("/v1/subscriptions/" + encodeURIComponent(subId));
+    if (!got.ok || !got.data || !got.data.id) {
+      if (got.status === 404) return res.status(404).json({ error: NO_SUBSCRIPTION_MESSAGE });
+      console.error("Stripe subscription lookup error:", got.status);
+      return res.status(502).json({ error: "Cancellation couldn't be completed. Please try again." });
+    }
+    sub = got.data;
+  }
+  if (!sub.metadata || sub.metadata.user_id !== user.id) {
+    return res.status(404).json({ error: NO_SUBSCRIPTION_MESSAGE });
+  }
+  if (sub.status === "canceled") {
+    return res.json({ cancelled: true, alreadyCancelled: true, planEndsAt: null });
+  }
+  if (sub.cancel_at_period_end) {
+    return res.json({ cancelled: true, alreadyCancelled: true, planEndsAt: stripePeriodEndIso(sub) || null });
+  }
+  if (sub.status !== "active" && sub.status !== "trialing") {
+    return res.status(404).json({ error: NO_SUBSCRIPTION_MESSAGE });
+  }
+  const result = await stripeApiPost("/v1/subscriptions/" + encodeURIComponent(subId), { cancel_at_period_end: "true" });
+  if (!result.ok || !result.data || !result.data.id) {
+    console.error("Stripe cancel error:", result.status, result.data && result.data.error ? result.data.error.message : "no response");
+    return res.status(502).json({ error: "Cancellation couldn't be completed. Please try again." });
+  }
+  const endsAt = stripePeriodEndIso(result.data) || null;
+  /* Best effort: record the end date now so the site shows "Pro until
+     <date>" straight away. The webhook's subscription.updated event
+     confirms the same thing a moment later, so a failure here is not
+     fatal — the cancel itself already happened at Stripe. */
+  await supabaseAdminUpsertProfileFields(user.id, { plan_ends_at: endsAt });
+  return res.json({ cancelled: true, alreadyCancelled: false, planEndsAt: endsAt });
 });
 
 /* ---------- Batch 3 money: Free/Pro daily limit (signed-in users only) ----------
