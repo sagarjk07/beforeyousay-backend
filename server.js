@@ -84,7 +84,7 @@ function sanitiseToneProfile(input) {
   if (!input || typeof input !== "object") return null;
   const clean = (v) => (typeof v === "string" ? v.trim().slice(0, 80) : "");
   const num = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.min(5, Math.max(1, Math.round(n))) : 3; };
-  const mode = ["workplace", "relationship", "negotiation"].includes(input.defaultMode) ? input.defaultMode : null;
+  const mode = ["career", "negotiation", "high_conflict", "boundaries"].includes(input.defaultMode) ? input.defaultMode : null;
   const reply = ["balanced", "calm", "assertive", "warm"].includes(input.defaultReplyStyle) ? input.defaultReplyStyle : null;
   return { name: clean(input.name), directness: num(input.directness), warmth: num(input.warmth), formality: num(input.formality), playfulness: num(input.playfulness), defaultMode: mode, defaultReplyStyle: reply };
 }
@@ -121,6 +121,24 @@ function styleText(style) {
   };
   return styles[style] || "";
 }
+function sanitiseGoal(input) {
+  if (typeof input !== "string") return null;
+  const goal = input.trim().slice(0, 200);
+  return goal ? goal : null;
+}
+function sanitiseDraft(input) {
+  if (typeof input !== "string") return null;
+  const draft = input.trim().slice(0, 1000);
+  return draft ? draft : null;
+}
+function goalText(goal) {
+  if (!goal) return "";
+  return "\nUser's exact goal: " + goal + "\nJudge every version against that goal — the best version is the one most likely to achieve it.";
+}
+function draftText(draft) {
+  if (!draft) return "";
+  return "\nThe user already drafted a reply. Grade it in draft_critique and fix it in your versions — do not just repeat it:\n" + draft;
+}
 function base64UrlDecode(s) { return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64"); }
 function verifySupabaseJwt(token) {
   const secret = process.env.SUPABASE_JWT_SECRET;
@@ -146,7 +164,7 @@ function optionalAuth(req, res, next) {
   return next();
 }
 
-function buildSystemPrompt(mode, toneProfile, style, context) {
+function buildSystemPrompt(mode, toneProfile, style, context, goal, draft) {
   const commonRules = `
 You are BeforeYouSay, an elite AI communication coach.
 
@@ -189,6 +207,14 @@ Return this exact JSON structure:
   "softer_version": "string",
   "stronger_version": "string",
   "coach_note": "string",
+  "power_dynamic": "string",
+  "emotional_trap": "string",
+  "draft_critique": "object or null",
+  "replies": [
+    { "strategy": "Hold the Line (Firm)", "message": "string", "why_it_works": "string" },
+    { "strategy": "De-escalate (Neutral)", "message": "string", "why_it_works": "string" },
+    { "strategy": "Strategic Pivot (Reframe)", "message": "string", "why_it_works": "string" }
+  ],
   "scores": {
     "clarity": 0,
     "confidence": 0,
@@ -206,27 +232,36 @@ Rules:
 - why_it_might_land_badly should explain how the message may be perceived, quoting the exact words that could land badly.
 - If the message is already strong, still improve it slightly.
 - Scores must match the text you just wrote: if the original is already clear and low-risk, scores are 8-10; if it is confusing or likely to upset the reader, effectiveness and emotional_control are 5 or below. Never give all four scores the same number.
+- power_dynamic must be exactly 2 sentences: who has the leverage in this exchange, and what tactic the other person is using (for example guilt-tripping, false urgency, or moving the goalposts).
+- emotional_trap must be exactly 1 sentence: what happens if the user replies defensively.
+- draft_critique is null when no draft was provided. When a draft was provided, it is {"score": 0-100, "flaw": "the exact flaw in 1 sentence"} — score how well the draft serves the user's goal.
+- replies must be exactly 3, in this order, with these exact strategy labels: "Hold the Line (Firm)", "De-escalate (Neutral)", "Strategic Pivot (Reframe)". Each message is the exact copy-pasteable text the user can send; each why_it_works is 1 line.
 `;
 
   const modeGuidance = {
-    workplace: `
-Mode: Workplace
-Optimize for professionalism, clarity, confidence, authority balance, concise wording, and low passive-aggression.
-Avoid sounding weak, emotional, rude, or awkward.
-`,
-    relationship: `
-Mode: Relationship
-Optimize for empathy, honesty, calmness, emotional clarity, and de-escalation.
-Avoid sounding cold, controlling, manipulative, reactive, or blaming.
+    career: `
+Mode: Career & Boss
+Optimize for pushback, raises, boundary setting, and covering yourself for HR. Document facts, stay professional, and keep a paper trail in the wording.
+Avoid sounding emotional, passive-aggressive, or apologetic about reasonable boundaries.
 `,
     negotiation: `
-Mode: Negotiation
-Optimize for leverage, clarity, assertiveness, persuasion, and calm confidence.
-Avoid sounding needy, overexplaining, emotional, defensive, or weak.
+Mode: Client & Negotiation
+Optimize for scope creep, pricing pushback, and closing deals. Be firm on value, name clear terms, and never concede without getting something back.
+Avoid sounding needy, overexplaining, or defensive.
+`,
+    high_conflict: `
+Mode: High-Conflict / Legal & Co-Parenting — STRICT BIFF
+BIFF only: Brief, Informative, Friendly, Firm. Keep every version short and factual. State only what happened, what you need, or what will happen next.
+No emotional hooks, no blame, no sarcasm, no advice about the other person, no rehashing history.
+`,
+    boundaries: `
+Mode: Hard Personal Boundaries
+Optimize for saying no to family and friends without blowing up the relationship. Warm but firm: one clear no, no over-explaining, no justifying, no apologising for the boundary itself.
+Avoid sounding cold, guilty, or preachy.
 `,
   };
 
-  return `${commonRules}\n${modeGuidance[mode] || ""}${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}\n${outputFormat}`;
+  return `${commonRules}\n${modeGuidance[mode] || ""}${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}${goalText(goal)}${draftText(draft)}\n${outputFormat}`;
 }
 
 /* Batch 4: AI scores must be integers 1-10; a missing or out-of-range score falls back to 6, never 0 or 11. */
@@ -235,7 +270,35 @@ function clampScoreOut(v) {
   const n = Number(v);
   return Number.isFinite(n) ? Math.min(10, Math.max(1, Math.round(n))) : 6;
 }
-function formatFallback(mode, message, data) {
+function clampDraftScoreOut(v) {
+  if (v === null || v === undefined || v === "") return 50; /* missing draft score */
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(100, Math.max(1, Math.round(n))) : 50;
+}
+/* Normalise the 3 tactical replies. A missing/invalid reply falls back
+   to the existing versions in order — Hold the Line <- better_version,
+   De-escalate <- softer_version, Strategic Pivot <- stronger_version —
+   so an old or partial model answer still shows 3 copy-pasteable replies. */
+function normaliseReplies(data, fallback) {
+  const strategies = ["Hold the Line (Firm)", "De-escalate (Neutral)", "Strategic Pivot (Reframe)"];
+  const src = fallback || data || {};
+  const fallbacks = [
+    { message: src.better_version || "", why_it_works: "The best balanced version for this situation." },
+    { message: src.softer_version || "", why_it_works: "A gentler version that lowers the temperature." },
+    { message: src.stronger_version || "", why_it_works: "A firmer version that reframes the exchange on your terms." },
+  ];
+  const given = Array.isArray(data && data.replies) ? data.replies : [];
+  return strategies.map(function (strategy, i) {
+    const r = given[i];
+    const message = r && typeof r.message === "string" && r.message.trim() ? r.message.trim() : fallbacks[i].message;
+    const why = r && typeof r.why_it_works === "string" && r.why_it_works.trim() ? r.why_it_works.trim() : fallbacks[i].why_it_works;
+    return { strategy: strategy, message: message, why_it_works: why };
+  });
+}
+function formatFallback(mode, message, data, hasDraft) {
+  const betterVersion = data?.better_version || message;
+  const softerVersion = data?.softer_version || message;
+  const strongerVersion = data?.stronger_version || message;
   return {
     mode,
     original_message: message,
@@ -246,9 +309,29 @@ function formatFallback(mode, message, data) {
     why_it_might_land_badly:
       data?.why_it_might_land_badly ||
       "The message may be misunderstood or come across differently than intended.",
-    better_version: data?.better_version || message,
-    softer_version: data?.softer_version || message,
-    stronger_version: data?.stronger_version || message,
+    better_version: betterVersion,
+    softer_version: softerVersion,
+    stronger_version: strongerVersion,
+    power_dynamic:
+      (typeof data?.power_dynamic === "string" && data.power_dynamic.trim())
+        ? data.power_dynamic.trim()
+        : "The other person holds the immediate leverage in this exchange — watch for pressure tactics and keep your reply short and factual.",
+    emotional_trap:
+      (typeof data?.emotional_trap === "string" && data.emotional_trap.trim())
+        ? data.emotional_trap.trim()
+        : "Replying defensively is likely to escalate the exchange and hand the other person the reaction they want.",
+    draft_critique: (function () {
+      if (!hasDraft) return null;
+      const c = data?.draft_critique;
+      if (c && typeof c === "object") {
+        return {
+          score: clampDraftScoreOut(c.score),
+          flaw: (typeof c.flaw === "string" && c.flaw.trim()) ? c.flaw.trim() : "The draft does not state a clear boundary or outcome.",
+        };
+      }
+      return { score: 50, flaw: "The draft does not state a clear boundary or outcome." };
+    })(),
+    replies: normaliseReplies(data, { better_version: betterVersion, softer_version: softerVersion, stronger_version: strongerVersion }),
     coach_note:
       data?.coach_note ||
       "Make the message clearer, calmer, and more intentional before sending.",
@@ -266,11 +349,12 @@ const limiter = rateLimit({
   max: 10,
   message: { error: "Too many requests. Please wait a minute and try again." },
 });
-function buildReplyPrompt(mode, toneProfile, style, context) {
+function buildReplyPrompt(mode, toneProfile, style, context, goal, draft) {
   const modeInstructions = {
-    workplace: `You are helping someone reply professionally to a message they received at work. Replies must be calm, clear, and boundary-aware. No slang. Keep it respectful and concise.`,
-    relationship: `You are helping someone reply in a relationship context to a message they received. Replies must be emotionally intelligent, honest, warm, and de-escalating. No blame or coldness.`,
-    negotiation: `You are helping someone reply in a negotiation to a message they received. Replies must be assertive, strategic, and calm. Show leverage without desperation. Stay in control.`
+    career: `You are helping someone reply professionally to a message they received at work — from a boss, colleague, or HR. Replies must be calm, clear, and boundary-aware, and cover the user for HR: facts first, no admissions, no emotion. No slang. Keep it respectful and concise.`,
+    negotiation: `You are helping someone reply in a client or commercial negotiation to a message they received. Replies must be assertive, strategic, and calm. Hold the line on scope and price, name clear terms, and show leverage without desperation. Stay in control.`,
+    high_conflict: `You are helping someone reply to a high-conflict, legal, or co-parenting message. Use STRICT BIFF only: Brief, Informative, Friendly, Firm. Short, factual replies. No emotional hooks, no blame, no sarcasm, no advice about the other person, no rehashing history.`,
+    boundaries: `You are helping someone reply to family or a friend when they need to hold a hard boundary. Replies must be warm but firm: one clear no, no over-explaining, no justifying. No guilt, no coldness, no blowing up the relationship.`
   };
 
   return `
@@ -279,7 +363,7 @@ You are BeforeYouSay, an elite AI communication coach.
 The user RECEIVED a message from someone else and needs help replying back.
 Write 3 replies FROM the user, responding TO the sender of that message.
 
-${modeInstructions[mode] || modeInstructions.workplace}
+${modeInstructions[mode] || modeInstructions.career}
 
 IMPORTANT EXAMPLES:
 - Received: "we need to talk about your performance"
@@ -298,6 +382,14 @@ Return valid JSON only in this exact structure:
   "softer_version": "string — a softer or warmer reply the user can send back",
   "stronger_version": "string — a more direct or assertive reply the user can send back",
   "coach_note": "string — one short tactical tip for this specific situation",
+  "power_dynamic": "string — 2 sentences: who has leverage, and what tactic the sender is using",
+  "emotional_trap": "string — 1 sentence: what happens if the user replies defensively",
+  "draft_critique": "object or null — when the user provided a draft: {"score": 0-100, "flaw": "the exact flaw in 1 sentence"}; null when no draft was provided",
+  "replies": [
+    { "strategy": "Hold the Line (Firm)", "message": "string — the exact reply to send", "why_it_works": "string — 1 line" },
+    { "strategy": "De-escalate (Neutral)", "message": "string — the exact reply to send", "why_it_works": "string — 1 line" },
+    { "strategy": "Strategic Pivot (Reframe)", "message": "string — the exact reply to send", "why_it_works": "string — 1 line" }
+  ],
   "risk_level": "low | medium | high — judge the received message, never leave it fixed",
   "should_send": "yes | edit_first | no — judge whether the best reply is safe to send as written",
   "intent_guess": "string — what the sender likely meant",
@@ -312,7 +404,8 @@ Rules:
 - Keep replies short and natural. No corporate speak. No over-explaining.
 - coach_note must be one punchy sentence of tactical advice.
 - Judge risk_level, should_send and the four scores from the received message and your replies — never leave them at fixed values. Scores are integers 1-10 and must differ where the reply's qualities differ.
-${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}
+- power_dynamic must be exactly 2 sentences (leverage + the sender's tactic); emotional_trap exactly 1 sentence. draft_critique is null when no draft was provided. replies must be exactly 3, in order, with the exact strategy labels "Hold the Line (Firm)", "De-escalate (Neutral)", "Strategic Pivot (Reframe)" — each message the exact copy-pasteable reply, each why_it_works 1 line.
+${toneProfileText(toneProfile)}${contextText(context)}${styleText(style)}${goalText(goal)}${draftText(draft)}
 `;
 }
 /* ---------- Batch 1 trust+control: delete my account ----------
@@ -884,10 +977,12 @@ app.use("/analyze", limiter);
 
 app.post("/analyze", analyzeLimiter, async (req, res) => {
   try {
-    const { message, mode, turnstileToken, replyMode, toneProfile, style, context } = req.body;
+    const { message, mode, turnstileToken, replyMode, toneProfile, style, context, goal, draft } = req.body;
     const safeToneProfile = sanitiseToneProfile(toneProfile); // Phase 0: optional, ignored if missing/invalid
     const safeStyle = sanitiseStyle(style); // Phase 1 contexts+styles: optional, ignored if missing/invalid
     const safeContext = sanitiseContext(context); // Phase 1 contexts+styles: optional, ignored if missing/invalid
+    const safeGoal = sanitiseGoal(goal); // Sprint 1: optional exact outcome/goal (max 200 chars), empty -> null
+    const safeDraft = sanitiseDraft(draft); // Sprint 1: optional drafted reply to grade (max 1000 chars), empty -> null
 
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Message is required." });
@@ -896,7 +991,7 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
       return res.status(400).json({ error: "Message is too long. Please keep it under 1000 characters." });
     }
 
-    if (!mode || !["workplace", "relationship", "negotiation"].includes(mode)) {
+    if (!mode || !["career", "negotiation", "high_conflict", "boundaries"].includes(mode)) {
       return res.status(400).json({ error: "Valid mode is required." });
     }
 
@@ -933,7 +1028,7 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
     }
 
     /* Batch 4: identical check within 10 minutes — serve the cached result instead of a second AI call. */
-    const cacheKey = analyzeCacheKey({ message: message.trim(), mode, replyMode: Boolean(replyMode), toneProfile: safeToneProfile, style: safeStyle, context: safeContext });
+    const cacheKey = analyzeCacheKey({ message: message.trim(), mode, replyMode: Boolean(replyMode), toneProfile: safeToneProfile, style: safeStyle, context: safeContext, goal: safeGoal, draft: safeDraft });
     const cached = analyzeCacheGet(cacheKey);
     if (cached) return res.json(cached);
 
@@ -942,7 +1037,7 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
       response_format: { type: "json_object" },
       temperature: 0.7, /* Batch 4: was 0.8 — slightly steadier scores and JSON, same model */
       messages: [
-       { role: "system", content: replyMode ? buildReplyPrompt(mode, safeToneProfile, safeStyle, safeContext) : buildSystemPrompt(mode, safeToneProfile, safeStyle, safeContext) },
+       { role: "system", content: replyMode ? buildReplyPrompt(mode, safeToneProfile, safeStyle, safeContext, safeGoal, safeDraft) : buildSystemPrompt(mode, safeToneProfile, safeStyle, safeContext, safeGoal, safeDraft) },
         {
           role: "user",
           content: `Analyze and improve this message:\n\n${message.trim()}`,
@@ -965,7 +1060,7 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
       return res.status(500).json({ error: "AI returned invalid JSON." });
     }
 
-    const finalData = formatFallback(mode, message.trim(), parsed);
+    const finalData = formatFallback(mode, message.trim(), parsed, Boolean(safeDraft));
     analyzeCacheSet(cacheKey, finalData);
 
     res.json(finalData);
