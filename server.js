@@ -59,6 +59,19 @@ app.use(function (req, res, next) {
   return express.json({ limit: "1mb" })(req, res, next);
 });
 
+/* Sprint 2 fix pass: a body over the parser limit (10mb on
+   /analyze-thread, 1mb elsewhere) gets a friendly JSON 413, never
+   Express's default HTML error page and never a crash. */
+app.use(function (err, req, res, next) {
+  if (err && (err.type === "entity.too.large" || err.status === 413)) {
+    const msg = req.path === "/analyze-thread"
+      ? "That upload is too large — try fewer or smaller screenshots."
+      : "That message is too large. Please keep it under 1000 characters.";
+    return res.status(413).json({ error: msg });
+  }
+  return next(err);
+});
+
 app.get("/", (req, res) => {
   res.send("BeforeYouSay backend is live");
 });
@@ -71,10 +84,16 @@ app.get("/health", (req, res) => {
   });
 });
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  timeout: 60000, /* Batch 4: a hung AI call fails after 60s instead of hanging forever */
-});
+/* Sprint 2 fix pass: the client is null when no OpenAI key is set, so the
+   server still starts when Gemini or MOCK_AI serves the vision route.
+   /analyze still gates on the key before using the client, and the
+   /analyze-thread OpenAI branch gates on the client below. */
+const client = process.env.OPENAI_API_KEY
+  ? new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+      timeout: 60000, /* Batch 4: a hung AI call fails after 60s instead of hanging forever */
+    })
+  : null;
 
 /* ---------- Phase 0: optional Supabase sign-in (backwards compatible) ----------
    - If no Authorization header is sent, or SUPABASE_JWT_SECRET is not set,
@@ -355,16 +374,97 @@ function formatFallback(mode, message, data, hasDraft) {
    POST /analyze-thread (below, after /analyze) sends up to 5 screenshots
    to a vision model. Images are Base64 in memory only — never written
    to disk, never stored, never logged — and dropped after the response.
-   Model: GPT-4o (VISION_MODEL, one constant so it can be swapped later),
-   chosen because Sagar specified GPT-4o or Gemini and the OpenAI key
-   already exists on Render — no new env var, no new dependency, no
-   Gemini key setup. The text endpoint stays on gpt-5.4-nano.
+   Sprint 2 fix pass: the vision model is no longer hardcoded. Provider
+   selection (selectVisionProvider, checked in this order):
+     1. MOCK_AI=true — LOCAL TESTING ONLY. Returns a realistic sample
+        (buildMockThreadResult) through the same shaping/fallbacks as the
+        real path, so the full UI flow can be tested with no API credits.
+        Never set MOCK_AI on Render.
+     2. GEMINI_API_KEY set — gemini-3.8-flash via plain fetch, multimodal
+        image inputs, structured JSON output. No new npm dependency.
+     3. OPENAI_API_KEY set — process.env.OPENAI_VISION_MODEL or
+        "gpt-4.1-mini" (Sprint 2 used gpt-4o; the default changed here).
+   The text endpoint stays on gpt-5.4-nano.
    No cache for thread analyses: two threads can look alike in text
    but differ in images, so a cached result could be stale for a
    different thread. */
-const VISION_MODEL = "gpt-4o";
+const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
+const GEMINI_VISION_MODEL = "gemini-3.8-flash";
 const THREAD_MAX_IMAGES = 5;
 const THREAD_MAX_TOTAL_BYTES = 6 * 1024 * 1024; /* decoded image bytes, in total - under the 10mb JSON limit, so an over-cap thread gets this friendly 413 instead of a parser error */
+const THREAD_MAX_IMAGE_BYTES = 2 * 1024 * 1024; /* decoded bytes per single image — one huge screenshot gets a friendly 413 even when the total is under 6MB */
+function selectVisionProvider() {
+  if (process.env.MOCK_AI === "true") return { provider: "mock" };
+  if (process.env.GEMINI_API_KEY) return { provider: "gemini", model: GEMINI_VISION_MODEL };
+  if (process.env.OPENAI_API_KEY) return { provider: "openai", model: OPENAI_VISION_MODEL };
+  return { provider: "none" };
+}
+function buildMockThreadResult(mode, imageCount, goal, hasDraft) {
+  /* Sprint 2 fix pass — MOCK_AI sample data. A generic workplace thread
+     (a manager pressing for a quick yes on a weekend shift), clearly a
+     sample: it never claims to be the user's real thread. It matches the
+     saved schema exactly (power_dynamic, emotional_trap, draft_critique,
+     replies exactly 3, pattern_summary exactly 15 words) and goes through
+     formatThreadFallback like a real provider response. */
+  return {
+    mode: mode,
+    original_message: "Sample thread (" + imageCount + " images) — a manager pressing for a quick yes on a weekend shift",
+    tone_detected: "Pressuring",
+    intent_guess: "Push for a quick yes before the user can check their calendar",
+    risk_level: "medium",
+    should_send: "edit_first",
+    why_it_might_land_badly: "Saying yes now sets a precedent that weekend shifts are always available.",
+    better_version: "Thanks for thinking of me — I need to check my calendar and will confirm by Friday.",
+    softer_version: "Thanks for asking — let me check what I have on and get back to you by Friday.",
+    stronger_version: "I can't take the weekend shift, but I can cover Tuesday if that helps.",
+    coach_note: "The riskiest phrase is the implied deadline — answer the ask, not the urgency.",
+    power_dynamic: "The manager holds the scheduling leverage in this exchange. They are using false urgency to force a quick yes before the user can think.",
+    emotional_trap: "Replying defensively will make the user look uncommitted and hand the manager the reaction they want.",
+    draft_critique: hasDraft ? { score: 42, flaw: "The draft apologises for a reasonable boundary instead of stating it." } : null,
+    replies: [
+      { strategy: "Hold the Line (Firm)", message: "I can't take the weekend shift.", why_it_works: "One clear no, no over-explaining." },
+      { strategy: "De-escalate (Neutral)", message: "Let me check my calendar and confirm by Friday.", why_it_works: "Buys time without conceding." },
+      { strategy: "Strategic Pivot (Reframe)", message: "I can't do the weekend, but I can cover Tuesday instead — does that help?", why_it_works: "Offers an alternative on the user's terms." },
+    ],
+    pattern_summary: "The other person used pressure and urgency to push for a quick yes today again.",
+    scores: { clarity: 8, confidence: 7, emotional_control: 9, effectiveness: 8 },
+  };
+}
+const VISION_UPSTREAM_ERROR = "The AI service couldn't be reached right now. Please try again in a moment.";
+function mapVisionUpstreamError(error) {
+  /* Sprint 2 fix pass: upstream 401/403/429 become a generic friendly
+     error — no raw provider strings, no keys, no status details leaked.
+     Only the status is ever logged, never the provider's message. */
+  const status = error && (error.status || (error.response && error.response.status));
+  if (status === 429) return { status: 429, error: "Too many requests to the AI service right now. Please wait a minute and try again." };
+  if (status === 401 || status === 403) return { status: 502, error: VISION_UPSTREAM_ERROR };
+  if (error && error.name === "AbortError") return { status: 502, error: VISION_UPSTREAM_ERROR };
+  return { status: 500, error: "Something went wrong. Please try again." };
+}
+async function callGeminiVision(prompt, images) {
+  /* Sprint 2 fix pass: Gemini via plain fetch — no new npm dependency.
+     Images go as inline_data parts (mime_type + base64); the model must
+     return JSON (responseMimeType application/json). Throws an Error with
+     a .status on HTTP failure so the route can map 401/403/429 cleanly. */
+  const parts = [{ text: prompt }];
+  images.forEach(function (url) {
+    const m = url.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+    if (m) parts.push({ inline_data: { mime_type: "image/" + m[1], data: m[2] } });
+  });
+  const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_VISION_MODEL + ":generateContent?key=" + encodeURIComponent(process.env.GEMINI_API_KEY || ""), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ parts: parts }], generationConfig: { responseMimeType: "application/json", temperature: 0.7 } }),
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) { const e = new Error("Gemini request failed"); e.status = res.status; throw e; }
+  const data = await res.json().catch(function () { return null; });
+  const text = data && data.candidates && data.candidates[0] && data.candidates[0].content && Array.isArray(data.candidates[0].content.parts)
+    ? data.candidates[0].content.parts.map(function (p) { return typeof p.text === "string" ? p.text : ""; }).join("")
+    : "";
+  if (!text.trim()) throw new Error("Gemini returned no text");
+  return text;
+}
 function sanitiseThreadImages(input) {
   if (!Array.isArray(input)) return { error: "Add at least 1 screenshot to analyse a thread.", status: 400 };
   if (input.length === 0) return { error: "Add at least 1 screenshot to analyse a thread.", status: 400 };
@@ -375,7 +475,9 @@ function sanitiseThreadImages(input) {
     if (typeof img !== "string") return { error: "Each screenshot must be a JPEG, PNG or WebP image.", status: 400 };
     const m = img.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
     if (!m) return { error: "Each screenshot must be a JPEG, PNG or WebP image.", status: 400 };
-    totalBytes += Math.floor(m[2].length * 3 / 4);
+    const decodedBytes = Math.floor(m[2].length * 3 / 4);
+    if (decodedBytes > THREAD_MAX_IMAGE_BYTES) return { error: "One screenshot is too large — try a smaller screenshot (max 2MB each).", status: 413 };
+    totalBytes += decodedBytes;
   }
   if (totalBytes > THREAD_MAX_TOTAL_BYTES) return { error: "Screenshots are too large in total — try fewer or smaller screenshots.", status: 413 };
   return { images: input };
@@ -1041,10 +1143,10 @@ async function supabaseCountToday(userId) {
 }
 async function checkSignedInDailyLimit(req) {
   const h = req.headers.authorization || "";
-  if (!h.startsWith("Bearer ")) return { blocked: false }; /* guest: frontend limit only */
-  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return { blocked: false }; /* fail open */
+  if (!h.startsWith("Bearer ")) return { blocked: false, signedIn: false }; /* guest: frontend limit only */
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return { blocked: false, signedIn: false }; /* fail open */
   const user = await getSupabaseUserFromToken(h.slice(7).trim());
-  if (!user) return { blocked: false }; /* fail open: bad token is already ignored by optionalAuth */
+  if (!user) return { blocked: false, signedIn: false }; /* fail open: bad token is already ignored by optionalAuth */
   /* Batch 4: the plan lookup and the today-count are independent, so
      they now run in parallel instead of one after the other — one fewer
      Supabase round trip before every signed-in check. Either failing
@@ -1063,11 +1165,36 @@ async function checkSignedInDailyLimit(req) {
     })(),
     supabaseCountToday(user.id),
   ]);
-  if (isProPlan(plan)) return { blocked: false };
-  if (used === null) return { blocked: false }; /* fail open */
-  if (used >= FREE_SIGNED_IN_DAILY_LIMIT) return { blocked: true, body: limitErrorBody(FREE_SIGNED_IN_DAILY_LIMIT, used) };
-  return { blocked: false };
+  if (isProPlan(plan)) return { blocked: false, signedIn: true };
+  if (used === null) return { blocked: false, signedIn: true }; /* fail open */
+  if (used >= FREE_SIGNED_IN_DAILY_LIMIT) return { blocked: true, body: limitErrorBody(FREE_SIGNED_IN_DAILY_LIMIT, used), signedIn: true };
+  return { blocked: false, signedIn: true };
 }
+/* ---------- Sprint 2 fix pass: guest hourly limit on the analyse endpoints ----------
+   Unauthenticated users (no valid Supabase token — checkSignedInDailyLimit
+   above is the same check the daily limit uses, so no second token lookup)
+   get max 5 analyse requests per hour per IP, on top of the existing
+   10/min shared limiter and the 20/15min limiter. Signed-in users are
+   exempt — their existing daily limits (Free 10/day, Pro unlimited)
+   still apply. The count only moves for requests that pass validation
+   and the daily-limit check, so a typo or a bad lane never burns a guest
+   check. In-memory only (a Render restart empties it); the friendly 429
+   names no internals. */
+const GUEST_ANALYZE_HOURLY_LIMIT = 5;
+const guestAnalyzeCounts = new Map();
+function guestAnalyzeAllowed(req) {
+  const ip = (req && req.ip) || "unknown";
+  const now = Date.now();
+  if (guestAnalyzeCounts.size > 1000) {
+    guestAnalyzeCounts.forEach(function (entry, key) { if (now >= entry.resetAt) guestAnalyzeCounts.delete(key); });
+  }
+  let entry = guestAnalyzeCounts.get(ip);
+  if (!entry || now >= entry.resetAt) { entry = { count: 0, resetAt: now + 60 * 60 * 1000 }; guestAnalyzeCounts.set(ip, entry); }
+  if (entry.count >= GUEST_ANALYZE_HOURLY_LIMIT) return false;
+  entry.count += 1;
+  return true;
+}
+const GUEST_HOURLY_LIMIT_MESSAGE = "You've used your 5 guest checks for this hour. Sign in for 10 free checks a day, or try again in an hour.";
 app.use("/analyze", optionalAuth);
 app.use("/analyze", limiter);
 
@@ -1095,6 +1222,10 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
     const limitCheck = await checkSignedInDailyLimit(req);
     if (limitCheck.blocked) {
       return res.status(429).json(limitCheck.body);
+    }
+    /* Sprint 2 fix pass: guests get 5 analyse requests an hour per IP (guestAnalyzeAllowed above). Signed-in users are exempt. */
+    if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
+      return res.status(429).json({ error: GUEST_HOURLY_LIMIT_MESSAGE });
     }
 
   if (!turnstileToken || !String(turnstileToken).trim()) {
@@ -1171,9 +1302,11 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
 /* ---------- Sprint 2: POST /analyze-thread ----------
    Same guards as /analyze: lane whitelist, signed-in daily limit (a
    thread counts as one check), Turnstile, 60s vision timeout, safe
-   JSON parsing, full fallback object. No cache (see above). Images
-   are Base64 in memory only — never written to disk, never stored,
-   never logged. */
+   JSON parsing, full fallback object. Sprint 2 fix pass adds the guest
+   5/hour per-IP limit (signed-in users exempt) and flexible vision
+   providers (MOCK_AI → Gemini → OpenAI, see selectVisionProvider).
+   No cache (see above). Images are Base64 in memory only — never
+   written to disk, never stored, never logged. */
 app.use("/analyze-thread", optionalAuth);
 app.use("/analyze-thread", limiter);
 app.post("/analyze-thread", analyzeLimiter, async (req, res) => {
@@ -1194,6 +1327,10 @@ app.post("/analyze-thread", analyzeLimiter, async (req, res) => {
     const safeImages = checked.images;
     const limitCheck = await checkSignedInDailyLimit(req);
     if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
+    /* Sprint 2 fix pass: guests get 5 analyse requests an hour per IP (guestAnalyzeAllowed above). Signed-in users are exempt. */
+    if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
+      return res.status(429).json({ error: GUEST_HOURLY_LIMIT_MESSAGE });
+    }
     if (!turnstileToken || !String(turnstileToken).trim()) {
       return res.status(400).json({ error: "Verification is required." });
     }
@@ -1212,23 +1349,37 @@ app.post("/analyze-thread", analyzeLimiter, async (req, res) => {
     if (!turnstileResult.success) {
       return res.status(403).json({ error: "Verification failed. Please try again." });
     }
-    if (!process.env.OPENAI_API_KEY) {
+    /* Sprint 2 fix pass: provider selection (mock → Gemini → OpenAI).
+       MOCK_AI is local testing only — never set it on Render. */
+    const visionProvider = selectVisionProvider();
+    if (visionProvider.provider === "none") {
       return res.status(500).json({ error: "AI service is not configured." });
     }
-    const userContent = [
-      { type: "text", text: "Read these " + safeImages.length + " screenshots in order as one chronological thread and analyse them against the user's goal." },
-    ];
-    safeImages.forEach(function (url) { userContent.push({ type: "image_url", image_url: { url: url } }); });
-    const response = await client.chat.completions.create({
-      model: VISION_MODEL,
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-      messages: [
-        { role: "system", content: buildThreadPrompt(mode, safeToneProfile, safeContext, safeGoal, safeDraft) },
-        { role: "user", content: userContent },
-      ],
-    });
-    const raw = response?.choices?.[0]?.message?.content;
+    const threadPrompt = buildThreadPrompt(mode, safeToneProfile, safeContext, safeGoal, safeDraft);
+    let raw = null;
+    if (visionProvider.provider === "mock") {
+      raw = JSON.stringify(buildMockThreadResult(mode, safeImages.length, safeGoal, Boolean(safeDraft)));
+    } else if (visionProvider.provider === "gemini") {
+      raw = await callGeminiVision(threadPrompt + "\nRead these " + safeImages.length + " screenshots in order as one chronological thread and analyse them against the user's goal.", safeImages);
+    } else {
+      if (!client) {
+        return res.status(500).json({ error: "AI service is not configured." });
+      }
+      const userContent = [
+        { type: "text", text: "Read these " + safeImages.length + " screenshots in order as one chronological thread and analyse them against the user's goal." },
+      ];
+      safeImages.forEach(function (url) { userContent.push({ type: "image_url", image_url: { url: url } }); });
+      const response = await client.chat.completions.create({
+        model: visionProvider.model,
+        response_format: { type: "json_object" },
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: threadPrompt },
+          { role: "user", content: userContent },
+        ],
+      });
+      raw = response?.choices?.[0]?.message?.content;
+    }
     if (!raw) return res.status(500).json({ error: "No result returned." });
     let parsed;
     try {
@@ -1240,8 +1391,13 @@ app.post("/analyze-thread", analyzeLimiter, async (req, res) => {
     const finalData = formatThreadFallback(mode, safeImages.length, parsed, Boolean(safeDraft), safeGoal);
     res.json(finalData);
   } catch (error) {
-    console.error("OpenAI error:", error.message);
-    res.status(500).json({ error: error.message || "Something went wrong." });
+    /* Sprint 2 fix pass: never leak a raw provider error — log only the
+       status (never the message, which can carry provider details) and
+       answer with the generic friendly error from mapVisionUpstreamError. */
+    if (error && error.status) console.error("Thread vision provider error status:", error.status);
+    else console.error("Thread analysis error");
+    const mapped = mapVisionUpstreamError(error);
+    res.status(mapped.status).json({ error: mapped.error });
   }
 });
 
