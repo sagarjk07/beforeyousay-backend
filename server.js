@@ -50,7 +50,14 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
   return res.json({ received: true, plan: change.plan });
 });
 
-app.use(express.json({ limit: "1mb" }));
+/* Sprint 2: screenshot threads send Base64 images, so /analyze-thread
+   gets a 10mb JSON body limit; every other route stays at 1mb. The
+   thread handler also checks the decoded image total itself (see
+   sanitiseThreadImages) and answers 413 when it is too large. */
+app.use(function (req, res, next) {
+  if (req.path === "/analyze-thread") return express.json({ limit: "10mb" })(req, res, next);
+  return express.json({ limit: "1mb" })(req, res, next);
+});
 
 app.get("/", (req, res) => {
   res.send("BeforeYouSay backend is live");
@@ -342,6 +349,95 @@ function formatFallback(mode, message, data, hasDraft) {
       effectiveness: clampScoreOut(data?.scores?.effectiveness),
     },
   };
+}
+
+/* ---------- Sprint 2: Multi-Screenshot Thread Engine ----------
+   POST /analyze-thread (below, after /analyze) sends up to 5 screenshots
+   to a vision model. Images are Base64 in memory only — never written
+   to disk, never stored, never logged — and dropped after the response.
+   Model: GPT-4o (VISION_MODEL, one constant so it can be swapped later),
+   chosen because Sagar specified GPT-4o or Gemini and the OpenAI key
+   already exists on Render — no new env var, no new dependency, no
+   Gemini key setup. The text endpoint stays on gpt-5.4-nano.
+   No cache for thread analyses: two threads can look alike in text
+   but differ in images, so a cached result could be stale for a
+   different thread. */
+const VISION_MODEL = "gpt-4o";
+const THREAD_MAX_IMAGES = 5;
+const THREAD_MAX_TOTAL_BYTES = 6 * 1024 * 1024; /* decoded image bytes, in total - under the 10mb JSON limit, so an over-cap thread gets this friendly 413 instead of a parser error */
+function sanitiseThreadImages(input) {
+  if (!Array.isArray(input)) return { error: "Add at least 1 screenshot to analyse a thread.", status: 400 };
+  if (input.length === 0) return { error: "Add at least 1 screenshot to analyse a thread.", status: 400 };
+  if (input.length > THREAD_MAX_IMAGES) return { error: "You can upload up to 5 screenshots in a thread.", status: 400 };
+  let totalBytes = 0;
+  for (let i = 0; i < input.length; i++) {
+    const img = input[i];
+    if (typeof img !== "string") return { error: "Each screenshot must be a JPEG, PNG or WebP image.", status: 400 };
+    const m = img.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+    if (!m) return { error: "Each screenshot must be a JPEG, PNG or WebP image.", status: 400 };
+    totalBytes += Math.floor(m[2].length * 3 / 4);
+  }
+  if (totalBytes > THREAD_MAX_TOTAL_BYTES) return { error: "Screenshots are too large in total — try fewer or smaller screenshots.", status: 413 };
+  return { images: input };
+}
+function patternSummary15(summary) {
+  const fallback = "The other person used pressure and urgency to push for a quick yes today again.";
+  const words = typeof summary === "string" ? summary.trim().split(/\s+/).filter(Boolean) : [];
+  if (!words.length) return fallback;
+  return words.slice(0, 15).join(" ");
+}
+function buildThreadPrompt(mode, toneProfile, context, goal, draft) {
+  const laneGuidance = {
+    career: `\nMode: Career & Boss\nOptimize for pushback, raises, boundary setting, and covering yourself for HR. Document facts, stay professional, and keep a paper trail in the wording.\nAvoid sounding emotional, passive-aggressive, or apologetic about reasonable boundaries.\n`,
+    negotiation: `\nMode: Client & Negotiation\nOptimize for scope creep, pricing pushback, and closing deals. Be firm on value, name clear terms, and never concede without getting something back.\nAvoid sounding needy, overexplaining, or defensive.\n`,
+    high_conflict: `\nMode: High-Conflict / Legal & Co-Parenting — STRICT BIFF\nBIFF only: Brief, Informative, Friendly, Firm. Keep every version short and factual. State only what happened, what you need, or what will happen next.\nNo emotional hooks, no blame, no sarcasm, no advice about the other person, no rehashing history.\n`,
+    boundaries: `\nMode: Hard Personal Boundaries\nOptimize for saying no to family and friends without blowing up the relationship. Warm but firm: one clear no, no over-explaining, no justifying, no apologising for the boundary itself.\nAvoid sounding cold, guilty, or preachy.\n`,
+  };
+  return `You are BeforeYouSay, an elite AI communication coach.
+Read the screenshots IN ORDER as one chronological thread — screenshot 1 happened first, the last screenshot happened last. Use bubble alignment and timestamps in the screenshots to tell who said what and when. Do not sound robotic. Do not use emojis.
+${laneGuidance[mode] || laneGuidance.career}${toneProfileText(toneProfile)}${contextText(context)}
+User's exact goal: ${goal}
+Judge every version against that goal — the best version is the one most likely to achieve it.${draftText(draft)}
+Return valid JSON only in this exact structure:
+{
+  "mode": "string",
+  "original_message": "string — describe the thread in one line, e.g. the topic of the exchange",
+  "tone_detected": "string",
+  "intent_guess": "string",
+  "risk_level": "low | medium | high",
+  "should_send": "yes | edit_first | no",
+  "why_it_might_land_badly": "string",
+  "better_version": "string",
+  "softer_version": "string",
+  "stronger_version": "string",
+  "coach_note": "string",
+  "power_dynamic": "string",
+  "emotional_trap": "string",
+  "draft_critique": "object or null",
+  "replies": [
+    { "strategy": "Hold the Line (Firm)", "message": "string", "why_it_works": "string" },
+    { "strategy": "De-escalate (Neutral)", "message": "string", "why_it_works": "string" },
+    { "strategy": "Strategic Pivot (Reframe)", "message": "string", "why_it_works": "string" }
+  ],
+  "pattern_summary": "string — exactly 15 words: a summary of the other person's behavior",
+  "scores": { "clarity": 0, "confidence": 0, "emotional_control": 0, "effectiveness": 0 }
+}
+Rules:
+- Scores must be integers from 1 to 10 and must match the text; never give all four scores the same number.
+- power_dynamic must be exactly 2 sentences: who has the leverage in this exchange, and what tactic the other person is using (for example guilt-tripping, false urgency, or moving the goalposts).
+- emotional_trap must be exactly 1 sentence: what happens if the user replies defensively.
+- draft_critique is null when no draft was provided. When a draft was provided, it is {"score": 0-100, "flaw": "the exact flaw in 1 sentence"} — score how well the draft serves the user's goal.
+- replies must be exactly 3, in this order, with these exact strategy labels: "Hold the Line (Firm)", "De-escalate (Neutral)", "Strategic Pivot (Reframe)". Each message is the exact copy-pasteable text the user can send; each why_it_works is 1 line.
+- pattern_summary must be exactly 15 words.
+- coach_note should be short and useful: name the single riskiest phrase in the thread and give one concrete fix for it.
+`;
+}
+function formatThreadFallback(mode, imageCount, data, hasDraft, goal) {
+  const label = "Screenshot thread (" + imageCount + " image" + (imageCount === 1 ? "" : "s") + ")";
+  const base = formatFallback(mode, label, data, hasDraft);
+  base.original_message = (typeof data?.original_message === "string" && data.original_message.trim()) ? data.original_message.trim() : label;
+  base.pattern_summary = patternSummary15(data?.pattern_summary);
+  return base;
 }
 
 const limiter = rateLimit({
@@ -1069,6 +1165,83 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
     res.status(500).json({
       error: error.message || "Something went wrong.",
     });
+  }
+});
+
+/* ---------- Sprint 2: POST /analyze-thread ----------
+   Same guards as /analyze: lane whitelist, signed-in daily limit (a
+   thread counts as one check), Turnstile, 60s vision timeout, safe
+   JSON parsing, full fallback object. No cache (see above). Images
+   are Base64 in memory only — never written to disk, never stored,
+   never logged. */
+app.use("/analyze-thread", optionalAuth);
+app.use("/analyze-thread", limiter);
+app.post("/analyze-thread", analyzeLimiter, async (req, res) => {
+  try {
+    const { images, mode, goal, turnstileToken, toneProfile, context, draft } = req.body || {};
+    const safeGoal = sanitiseGoal(goal); /* required for a thread */
+    const safeDraft = sanitiseDraft(draft);
+    const safeToneProfile = sanitiseToneProfile(toneProfile);
+    const safeContext = sanitiseContext(context);
+    if (!safeGoal) {
+      return res.status(400).json({ error: "What is your exact goal here? Add your goal to analyse a screenshot thread." });
+    }
+    if (!mode || !["career", "negotiation", "high_conflict", "boundaries"].includes(mode)) {
+      return res.status(400).json({ error: "Valid mode is required." });
+    }
+    const checked = sanitiseThreadImages(images);
+    if (checked.error) return res.status(checked.status).json({ error: checked.error });
+    const safeImages = checked.images;
+    const limitCheck = await checkSignedInDailyLimit(req);
+    if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
+    if (!turnstileToken || !String(turnstileToken).trim()) {
+      return res.status(400).json({ error: "Verification is required." });
+    }
+    if (!process.env.TURNSTILE_SECRET_KEY) {
+      return res.status(500).json({ error: "Server verification is not configured." });
+    }
+    const formData = new URLSearchParams();
+    formData.append("secret", process.env.TURNSTILE_SECRET_KEY);
+    formData.append("response", turnstileToken);
+    const turnstileResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      body: formData,
+      signal: AbortSignal.timeout(10000),
+    });
+    const turnstileResult = await turnstileResponse.json();
+    if (!turnstileResult.success) {
+      return res.status(403).json({ error: "Verification failed. Please try again." });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "AI service is not configured." });
+    }
+    const userContent = [
+      { type: "text", text: "Read these " + safeImages.length + " screenshots in order as one chronological thread and analyse them against the user's goal." },
+    ];
+    safeImages.forEach(function (url) { userContent.push({ type: "image_url", image_url: { url: url } }); });
+    const response = await client.chat.completions.create({
+      model: VISION_MODEL,
+      response_format: { type: "json_object" },
+      temperature: 0.7,
+      messages: [
+        { role: "system", content: buildThreadPrompt(mode, safeToneProfile, safeContext, safeGoal, safeDraft) },
+        { role: "user", content: userContent },
+      ],
+    });
+    const raw = response?.choices?.[0]?.message?.content;
+    if (!raw) return res.status(500).json({ error: "No result returned." });
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseError) {
+      console.error("JSON parse error:", parseError.message);
+      return res.status(500).json({ error: "AI returned invalid JSON." });
+    }
+    const finalData = formatThreadFallback(mode, safeImages.length, parsed, Boolean(safeDraft), safeGoal);
+    res.json(finalData);
+  } catch (error) {
+    console.error("OpenAI error:", error.message);
+    res.status(500).json({ error: error.message || "Something went wrong." });
   }
 });
 
