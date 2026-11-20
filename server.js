@@ -84,7 +84,7 @@ function sanitiseToneProfile(input) {
   if (!input || typeof input !== "object") return null;
   const clean = (v) => (typeof v === "string" ? v.trim().slice(0, 80) : "");
   const num = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.min(5, Math.max(1, Math.round(n))) : 3; };
-  const mode = ["workplace", "relationship", "rizz", "negotiation"].includes(input.defaultMode) ? input.defaultMode : null;
+  const mode = ["workplace", "relationship", "negotiation"].includes(input.defaultMode) ? input.defaultMode : null;
   const reply = ["balanced", "calm", "assertive", "warm"].includes(input.defaultReplyStyle) ? input.defaultReplyStyle : null;
   return { name: clean(input.name), directness: num(input.directness), warmth: num(input.warmth), formality: num(input.formality), playfulness: num(input.playfulness), defaultMode: mode, defaultReplyStyle: reply };
 }
@@ -219,11 +219,6 @@ Mode: Relationship
 Optimize for empathy, honesty, calmness, emotional clarity, and de-escalation.
 Avoid sounding cold, controlling, manipulative, reactive, or blaming.
 `,
-    rizz: `
-Mode: Rizz
-Optimize for charm, confidence, playfulness, smoothness, and attraction.
-Avoid cringe, desperation, awkwardness, try-hard energy, or weird over-flirting.
-`,
     negotiation: `
 Mode: Negotiation
 Optimize for leverage, clarity, assertiveness, persuasion, and calm confidence.
@@ -275,7 +270,6 @@ function buildReplyPrompt(mode, toneProfile, style, context) {
   const modeInstructions = {
     workplace: `You are helping someone reply professionally to a message they received at work. Replies must be calm, clear, and boundary-aware. No slang. Keep it respectful and concise.`,
     relationship: `You are helping someone reply in a relationship context to a message they received. Replies must be emotionally intelligent, honest, warm, and de-escalating. No blame or coldness.`,
-    rizz: `You are helping someone reply with rizz to a message they received. Replies must be smooth, playful, and slightly cocky without being desperate or cringe. Think: unbothered, funny, attractive energy. Never formal. Never "I respect that." Never "no worries." Keep it short and punchy.`,
     negotiation: `You are helping someone reply in a negotiation to a message they received. Replies must be assertive, strategic, and calm. Show leverage without desperation. Stay in control.`
   };
 
@@ -292,9 +286,9 @@ IMPORTANT EXAMPLES:
   ✅ Correct reply: "Sure, happy to connect. When works for you?"
   ❌ Wrong reply: "We need to discuss your performance and align on next steps."
 
-- Received: "i have a boyfriend"
-  ✅ Correct reply: "Respect. So coffee as friends then?"
-  ❌ Wrong reply: "I have a boyfriend so I can't pursue anything further."
+- Received: "are you free to hop on a quick call?"
+  ✅ Correct reply: "Sure — now works, or after 3pm?"
+  ❌ Wrong reply: "You are asking me if I am free for a call."
 
 Return valid JSON only in this exact structure:
 {
@@ -314,7 +308,7 @@ Return valid JSON only in this exact structure:
 Rules:
 - The user is the RECIPIENT. All 3 replies are what THEY send back to the other person.
 - Never rewrite or rephrase the received message from the sender's perspective.
-- Replies must match the mode tone strictly — especially for rizz, be smooth and witty not polite.
+- Replies must match the mode tone strictly.
 - Keep replies short and natural. No corporate speak. No over-explaining.
 - coach_note must be one punchy sentence of tactical advice.
 - Judge risk_level, should_send and the four scores from the received message and your replies — never leave them at fixed values. Scores are integers 1-10 and must differ where the reply's qualities differ.
@@ -902,7 +896,7 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
       return res.status(400).json({ error: "Message is too long. Please keep it under 1000 characters." });
     }
 
-    if (!mode || !["workplace", "relationship", "rizz", "negotiation"].includes(mode)) {
+    if (!mode || !["workplace", "relationship", "negotiation"].includes(mode)) {
       return res.status(400).json({ error: "Valid mode is required." });
     }
 
