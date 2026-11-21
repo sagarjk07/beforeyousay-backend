@@ -56,6 +56,7 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
    sanitiseThreadImages) and answers 413 when it is too large. */
 app.use(function (req, res, next) {
   if (req.path === "/analyze-thread") return express.json({ limit: "10mb" })(req, res, next);
+  if (req.path === "/vault/upload" || req.path === "/hr-audit") return express.json({ limit: "14mb" })(req, res, next);
   return express.json({ limit: "1mb" })(req, res, next);
 });
 
@@ -66,6 +67,8 @@ app.use(function (err, req, res, next) {
   if (err && (err.type === "entity.too.large" || err.status === 413)) {
     const msg = req.path === "/analyze-thread"
       ? "That upload is too large — try fewer or smaller screenshots."
+      : (req.path === "/vault/upload" || req.path === "/hr-audit")
+      ? "That file is too large — 10MB max per document."
       : "That message is too large. Please keep it under 1000 characters.";
     return res.status(413).json({ error: msg });
   }
@@ -1398,6 +1401,686 @@ app.post("/analyze-thread", analyzeLimiter, async (req, res) => {
     else console.error("Thread analysis error");
     const mapped = mapVisionUpstreamError(error);
     res.status(mapped.status).json({ error: mapped.error });
+  }
+});
+
+/* ---------- B2B HR & Policy Compliance Firewall V1 ----------
+   POST /vault/upload, GET /vault/list, POST /vault/delete,
+   POST /hr-guardrail, POST /hr-audit.
+   Australian small businesses (10-150 staff, no in-house lawyer).
+   Jurisdiction: Australia only — Fair Work Act 2009 + the National
+   Employment Standards (NES). US/UK are Coming Soon, not supported.
+   No supabase-js: Supabase is reached with plain fetch + the
+   service-role key, the same way /delete-account does it. No Stripe
+   changes. No cache for HR results. MOCK_AI is local testing only —
+   never set it on Render. Vault documents ARE stored (they have to
+   be, to be checked against); screenshots were never stored. */
+const OPENAI_TEXT_MODEL = "gpt-5.4-nano"; /* same text model as /analyze */
+const GEMINI_TEXT_MODEL = GEMINI_VISION_MODEL; /* gemini-3.8-flash, text call */
+const HR_SCENARIOS = ["performance", "leave", "termination", "contractor"];
+const HR_SCENARIO_LABELS = {
+  performance: "Performance & Warnings",
+  leave: "Leave & Roster Changes",
+  termination: "Termination & Redundancy",
+  contractor: "Contractor & Client Scope",
+};
+const VAULT_DOC_TYPES = ["handbook", "contract", "policy", "other"];
+const VAULT_MIMES = [
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "text/plain",
+];
+const VAULT_MAX_DOCS = 10;
+const VAULT_MAX_FILE_BYTES = 10 * 1024 * 1024; /* 10MB decoded per file */
+const VAULT_CONTEXT_MAX_CHARS = 60000; /* vault text passed to the AI, newest first */
+const HR_AUDIT_MAX_TEXT_CHARS = 20000;
+const HR_GUARDRAIL_MAX_DRAFT_CHARS = 5000;
+const VAULT_AUTH_ERROR = "Sign in to upload company documents.";
+const VAULT_NOT_SETUP_ERROR = "Company Vault isn't set up yet — the database table is still to be created. Ask the site owner to run the migration.";
+const VAULT_FILE_TOO_LARGE_ERROR = "That file is too large — 10MB max per document.";
+const VAULT_FULL_ERROR = "Your Company Vault is full (10 documents max).";
+
+/* NES + unfair dismissal baselines (Fair Work Act 2009, Part 2-2 NES;
+   Fair Work Ombudsman "Notice of termination & redundancy pay" fact
+   sheet; Redfern Legal Centre "Unfair dismissal" factsheet, 30 Oct 2025).
+   Verified 21 Nov 2026 — these numbers are the baselines, do not invent
+   others. Passed to the AI as prompt context, not as a guarantee. */
+const NES_BASELINES = `
+Australian Fair Work baselines (Fair Work Act 2009, National Employment Standards, Part 2-2):
+- Maximum weekly hours: 38 hours/week for full-time employees, plus reasonable additional hours.
+- Annual leave: 4 weeks' paid leave per year (5 weeks for certain shiftworkers), pro rata for part-time.
+- Personal/carer's leave: 10 days' paid leave per year (pro rata); compassionate leave: 2 days' paid leave per permissible occasion; 2 days' unpaid carer's leave per permissible occasion. Casuals get 2 days' unpaid carer's and 2 days' unpaid compassionate leave per occasion. Family and domestic violence leave is paid leave.
+- Flexible working arrangements: eligible employees (12+ months' service, including parents/carers of school-age children, carers, people with disability, employees 55+, victims of family/domestic violence) may request flexible work; the employer must respond in writing within 21 days and may only refuse on reasonable business grounds.
+- Parental leave: 12 months' unpaid leave (after 12 months' service), with a right to request an additional 12 months.
+- Long service leave: as provided by state/territory laws (commonly after 7-10 years' continuous service).
+- Public holidays: paid day off if the employee would ordinarily work; the employer may make a reasonable request to work.
+- Notice of termination: written notice of the day of termination is required. Minimum notice: 1 year or less = 1 week; more than 1-3 years = 2 weeks; more than 3-5 years = 3 weeks; more than 5 years = 4 weeks; plus 1 week if the employee is over 45 with at least 2 years' service. Payment in lieu at the full pay rate is allowed. No notice is required for casuals, fixed-term/seasonal employees, dismissal for serious misconduct, trainees (not apprentices), or daily/weekly hire in building/construction or meat industries.
+- Redundancy pay: 4-16 weeks' base pay by length of service, only for employees with 12+ months' service, and only if the employer is NOT a small business (fewer than 15 employees are exempt from redundancy pay).
+- Fair Work Information Statement: must be given to new employees before, or as soon as practicable after, they start. Casuals must also be given the Casual Employment Information Statement.
+- Casual conversion: casuals can request conversion to permanent after 6 months (12 months for small business employers).
+- Superannuation guarantee: 12% from 1 July 2025.
+Unfair dismissal overlay (Fair Work Act 2009, Part 3-2):
+- 21 days from the day the dismissal takes effect to lodge an application (Form F2) with the Fair Work Commission. Extensions are very hard to get.
+- Minimum employment period: 6 months, or 12 months if the employer is a small business (fewer than 15 employees).
+- Coverage: the employee must be covered by a modern award or enterprise agreement, OR earn below the high income threshold: $190,100 for dismissals on or after 1 July 2026.
+- Test: the dismissal must not be harsh, unjust or unreasonable — a valid reason plus procedural fairness (employee told the reason, given a chance to respond, allowed a support person).
+- Small Business Fair Dismissal Code (fewer than 15 employees): summary dismissal is allowed for serious misconduct; otherwise the employer must give a warning and a chance to improve, in writing. Complying with the Code is a defence to unfair dismissal.
+- Remedies: reinstatement is the primary remedy; compensation is capped at the lesser of 26 weeks' pay and half the high income threshold ($95,050 for dismissals from 1 July 2026).
+- Genuine redundancy is a defence (real operational reasons, proper consultation, no reasonable redeployment).
+- General protections claims (for example dismissal for exercising a workplace right) have no minimum employment period and no income cap, and the same 21-day deadline applies.
+`;
+
+function selectHrProvider() {
+  /* Same order as selectVisionProvider: MOCK_AI -> Gemini -> OpenAI.
+     MOCK_AI is local testing only — never set it on Render. */
+  if (process.env.MOCK_AI === "true") return { provider: "mock" };
+  if (process.env.GEMINI_API_KEY) return { provider: "gemini", model: GEMINI_TEXT_MODEL };
+  if (process.env.OPENAI_API_KEY) return { provider: "openai", model: OPENAI_TEXT_MODEL };
+  return { provider: "none" };
+}
+async function callGeminiText(prompt) {
+  /* Gemini text call via plain fetch — no new npm dependency. Same
+     shape as callGeminiVision but text-only (no image parts). Throws
+     an Error with a .status on HTTP failure so the route can map
+     401/403/429 cleanly with mapVisionUpstreamError. */
+  const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_TEXT_MODEL + ":generateContent?key=" + encodeURIComponent(process.env.GEMINI_API_KEY || ""), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.7 } }),
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) { const e = new Error("Gemini request failed"); e.status = res.status; throw e; }
+  const data = await res.json().catch(function () { return null; });
+  const text = data && data.candidates && data.candidates[0] && data.candidates[0].content && Array.isArray(data.candidates[0].content.parts)
+    ? data.candidates[0].content.parts.map(function (p) { return typeof p.text === "string" ? p.text : ""; }).join("")
+    : "";
+  if (!text.trim()) throw new Error("Gemini returned no text");
+  return text;
+}
+function buildMockGuardrailResult(scenario) {
+  /* MOCK_AI canned samples — schema-valid, realistic, clearly samples.
+     Termination MUST be High risk with the unfair dismissal trap. */
+  const rewrites = {
+    termination: {
+      firm_formal: "Following our written warning of 12 November and the meeting on 18 November, your employment will end on 2 December 2026, with 2 weeks' notice paid at your full pay rate. You may bring a support person to a final meeting on 25 November to discuss this decision before it is finalised.",
+      constructive_neutral: "I want to talk through the performance concerns we raised in writing on 12 November, and hear your side before any decision is made. Can we meet on 25 November, with a support person if you would like one?",
+    },
+    performance: {
+      firm_formal: "This is a formal written warning about the missed deadlines on 3 and 10 November. The standard is delivery by the agreed date; please confirm by Friday how you will meet it. If there is no improvement in the next four weeks, further action may follow.",
+      constructive_neutral: "I want to work through the recent missed deadlines with you and agree a plan to get back on track. Can we meet on Thursday to talk it through?",
+    },
+    leave: {
+      firm_formal: "Your request for flexible working arrangements has been received. We will respond in writing within 21 days, and any refusal will be on reasonable business grounds only.",
+      constructive_neutral: "Thanks for letting me know — I'll confirm your leave dates in writing by Friday so we can plan cover.",
+    },
+    contractor: {
+      firm_formal: "To confirm scope in writing: this engagement covers the website rebuild only, for $4,500, due 15 December. Any extra work will be quoted separately before it starts.",
+      constructive_neutral: "Just confirming the scope in writing so we are on the same page — the rebuild only, $4,500, due 15 December. Happy to quote anything extra separately.",
+    },
+  };
+  const samples = {
+    termination: {
+      compliance_risk_level: "High",
+      policy_and_fair_work_conflicts: [
+        { clause: "Small Business Fair Dismissal Code — warning and chance to improve in writing before dismissal", source: "fair_work_act", detail: "The draft dismisses the employee on the spot with no prior written warning and no chance to improve, so the Code defence is not available." },
+        { clause: "NES notice of termination — 2 weeks at 2 years' service", source: "fair_work_nes", detail: "The draft gives no notice period and no payment in lieu; at 2 years' service the minimum is 2 weeks' notice at the full pay rate." },
+        { clause: "Unfair dismissal — valid reason plus procedural fairness", source: "fair_work_act", detail: "The employee was never told the reason in writing or given a chance to respond with a support person present." },
+      ],
+      legal_hr_trap_warning: "This reads as an on-the-spot dismissal with no prior written warning — the employee can lodge an unfair dismissal claim with the Fair Work Commission within 21 days of the dismissal taking effect.",
+      rewrites: rewrites.termination,
+    },
+    performance: {
+      compliance_risk_level: "Medium",
+      policy_and_fair_work_conflicts: [
+        { clause: "Unfair dismissal — valid reason plus procedural fairness", source: "fair_work_act", detail: "The warning names no specific incidents or dates and gives no clear standard to improve against, so it would be weak evidence if the matter later reaches the Fair Work Commission." },
+      ],
+      legal_hr_trap_warning: "A vague warning with no dates, no standard and no improvement period can be treated as if no warning was given at all.",
+      rewrites: rewrites.performance,
+    },
+    leave: {
+      compliance_risk_level: "Medium",
+      policy_and_fair_work_conflicts: [
+        { clause: "NES flexible working arrangements — written response within 21 days, refusal only on reasonable business grounds", source: "fair_work_nes", detail: "The draft refuses the request verbally with no written response and no business grounds, which the NES does not allow." },
+      ],
+      legal_hr_trap_warning: "Refusing a flexible work request without a written response within 21 days, on reasonable business grounds, breaches the NES.",
+      rewrites: rewrites.leave,
+    },
+    contractor: {
+      compliance_risk_level: "Low",
+      policy_and_fair_work_conflicts: [
+        { clause: "Contractor scope must be confirmed in writing", source: "company_policy", detail: "The draft agrees extra work in a chat message with no written scope, price or date, which invites a scope dispute later." },
+      ],
+      legal_hr_trap_warning: "Agreeing extra work without a written scope and price can turn a fixed-price engagement into an open-ended one.",
+      rewrites: rewrites.contractor,
+    },
+  };
+  return samples[scenario] || samples.performance;
+}
+function buildMockAuditResult() {
+  /* MOCK_AI canned sample — schema-valid. Missing notice of
+     termination clause + Fair Work Information Statement reference,
+     one contradiction, one suggested rewrite. */
+  return {
+    missing_mandatory_clauses: [
+      "Notice of termination clause",
+      "Fair Work Information Statement reference",
+    ],
+    contradictions_with_existing_policy: [
+      { clause: "Probation period of 12 months", vault_source: "Employee Handbook.pdf", detail: "The contract states a 12-month probation period, but the vault handbook caps probation at 6 months." },
+    ],
+    suggested_clause_rewrites: [
+      { original: "Notice of termination clause (missing)", rewrite: "Either party may terminate this employment by giving written notice: 1 week for service of 1 year or less, 2 weeks for more than 1 to 3 years, 3 weeks for more than 3 to 5 years, and 4 weeks for more than 5 years, plus 1 week if the employee is over 45 with at least 2 years' service, or payment in lieu at the full pay rate.", reason: "NES 9 (Fair Work Act 2009, Part 2-2) sets these minimum notice periods; a contract with no notice clause leaves the business exposed to an underpayment or unfair dismissal claim." },
+    ],
+  };
+}
+function formatGuardrailResult(data) {
+  /* Normalise any provider answer into the strict guardrail shape —
+     exactly the contract fields, nothing extra. A missing or invalid
+     piece falls back to a safe neutral value, never a crash. */
+  const levels = ["Low", "Medium", "High"];
+  const risk = levels.includes(data && data.compliance_risk_level) ? data.compliance_risk_level : "Medium";
+  const sources = ["company_policy", "fair_work_nes", "fair_work_act"];
+  const conflicts = Array.isArray(data && data.policy_and_fair_work_conflicts)
+    ? data.policy_and_fair_work_conflicts.map(function (c) {
+        return {
+          clause: typeof c.clause === "string" && c.clause.trim() ? c.clause.trim() : "Unspecified compliance issue",
+          source: sources.includes(c.source) ? c.source : "fair_work_nes",
+          detail: typeof c.detail === "string" && c.detail.trim() ? c.detail.trim() : "",
+        };
+      })
+    : [];
+  const trap = typeof data?.legal_hr_trap_warning === "string" && data.legal_hr_trap_warning.trim()
+    ? data.legal_hr_trap_warning.trim()
+    : "Check this against your company policy and the Fair Work baselines before sending.";
+  const rewrites = data && data.rewrites && typeof data.rewrites === "object" ? data.rewrites : {};
+  return {
+    compliance_risk_level: risk,
+    policy_and_fair_work_conflicts: conflicts,
+    legal_hr_trap_warning: trap,
+    rewrites: {
+      firm_formal: typeof rewrites.firm_formal === "string" && rewrites.firm_formal.trim() ? rewrites.firm_formal.trim() : "",
+      constructive_neutral: typeof rewrites.constructive_neutral === "string" && rewrites.constructive_neutral.trim() ? rewrites.constructive_neutral.trim() : "",
+    },
+  };
+}
+function formatAuditResult(data) {
+  const missing = Array.isArray(data && data.missing_mandatory_clauses)
+    ? data.missing_mandatory_clauses.filter(function (c) { return typeof c === "string" && c.trim(); }).map(function (c) { return c.trim(); })
+    : [];
+  const contradictions = Array.isArray(data && data.contradictions_with_existing_policy)
+    ? data.contradictions_with_existing_policy.map(function (c) {
+        return {
+          clause: typeof c.clause === "string" && c.clause.trim() ? c.clause.trim() : "Unspecified clause",
+          vault_source: typeof c.vault_source === "string" && c.vault_source.trim() ? c.vault_source.trim() : "",
+          detail: typeof c.detail === "string" && c.detail.trim() ? c.detail.trim() : "",
+        };
+      })
+    : [];
+  const rewrites = Array.isArray(data && data.suggested_clause_rewrites)
+    ? data.suggested_clause_rewrites.map(function (r) {
+        return {
+          original: typeof r.original === "string" && r.original.trim() ? r.original.trim() : "",
+          rewrite: typeof r.rewrite === "string" && r.rewrite.trim() ? r.rewrite.trim() : "",
+          reason: typeof r.reason === "string" && r.reason.trim() ? r.reason.trim() : "",
+        };
+      })
+    : [];
+  return { missing_mandatory_clauses: missing, contradictions_with_existing_policy: contradictions, suggested_clause_rewrites: rewrites };
+}
+function buildGuardrailPrompt(draft, scenario, vaultContext) {
+  return `You are BeforeYouSay HR Guardrail, an Australian HR compliance checker for small businesses.
+Jurisdiction: Australia — Fair Work Act 2009 and the National Employment Standards (NES). Do not apply any other country's law.
+Scenario: ${HR_SCENARIO_LABELS[scenario] || scenario}.
+Draft message to check before sending:
+---
+${draft}
+---
+Company policies (newest first; these are the employer's own rules — a conflict with them is a conflict even if the law allows it):
+${vaultContext || "No company documents uploaded — check against the Fair Work baselines only."}
+${NES_BASELINES}
+Return valid JSON only in this exact structure:
+{
+  "compliance_risk_level": "Low | Medium | High",
+  "policy_and_fair_work_conflicts": [
+    { "clause": "string — the exact clause/rule violated", "source": "company_policy | fair_work_nes | fair_work_act", "detail": "string — what the draft does wrong" }
+  ],
+  "legal_hr_trap_warning": "string — the single biggest trap, 1-2 sentences",
+  "rewrites": { "firm_formal": "string — a firm, formal rewrite of the draft", "constructive_neutral": "string — a constructive, neutral rewrite of the draft" }
+}
+Rules:
+- Judge risk honestly: an on-the-spot dismissal with no warning is High; a vague warning or a refused leave request with no written grounds is Medium; a clean, documented message is Low.
+- Name the exact clause or NES rule in each conflict; never invent a clause number or a dollar figure that is not in the baselines above.
+- The trap warning must be the single biggest risk, in 1-2 sentences.
+- Both rewrites must keep the manager's intent but remove the compliance risk; keep them sendable as written.
+- This is operational policy alignment only, not formal legal advice — do not present it as legal advice.`;
+}
+function buildAuditPrompt(documentText, vaultContext) {
+  return `You are BeforeYouSay Contract & Policy Auditor, an Australian HR compliance checker for small businesses.
+Jurisdiction: Australia — Fair Work Act 2009 and the National Employment Standards (NES). Do not apply any other country's law.
+Document to audit:
+---
+${documentText}
+---
+Company policies already on file (newest first; the document must not contradict them):
+${vaultContext || "No company documents uploaded — check against the Fair Work baselines only."}
+${NES_BASELINES}
+Return valid JSON only in this exact structure:
+{
+  "missing_mandatory_clauses": ["string — each a clause the document must have but doesn't"],
+  "contradictions_with_existing_policy": [
+    { "clause": "string", "vault_source": "string — file_name of the vault doc", "detail": "string" }
+  ],
+  "suggested_clause_rewrites": [
+    { "original": "string — the offending wording (or the missing clause name)", "rewrite": "string — compliant replacement wording", "reason": "string — why, citing the NES/policy rule" }
+  ]
+}
+Rules:
+- A contract must have, at minimum: position and duties, employment type and hours (38 hours/week for full-time), pay, leave per the NES, probation, notice of termination per the NES, and a Fair Work Information Statement reference. Flag each one that is missing.
+- Only list a contradiction when the document genuinely conflicts with a vault document — never invent a vault document.
+- Never invent a clause number, a dollar figure, or a leave amount that is not in the baselines above.
+- This is operational policy alignment only, not formal legal advice — do not present it as legal advice.`;
+}
+async function verifyTurnstile(req) {
+  /* Shared Turnstile check for the HR routes (same messages as
+     /analyze). Returns null when verification passes, else
+     { status, error } for the route to answer with. */
+  const token = req.body && req.body.turnstileToken;
+  if (!token || !String(token).trim()) return { status: 400, error: "Verification is required." };
+  if (!process.env.TURNSTILE_SECRET_KEY) return { status: 500, error: "Server verification is not configured." };
+  const formData = new URLSearchParams();
+  formData.append("secret", process.env.TURNSTILE_SECRET_KEY);
+  formData.append("response", String(token));
+  const turnstileResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(10000),
+  });
+  const turnstileResult = await turnstileResponse.json().catch(function () { return null; });
+  if (!turnstileResult || !turnstileResult.success) return { status: 403, error: "Verification failed. Please try again." };
+  return null;
+}
+async function requireVaultUser(req, res) {
+  /* Vault auth: the token is checked by asking Supabase itself
+     (getSupabaseUserFromToken), the same way /delete-account does it.
+     optionalAuth is NOT used here — it silently ignores bad tokens
+     when SUPABASE_JWT_SECRET is unset. */
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) { res.status(401).json({ error: VAULT_AUTH_ERROR }); return null; }
+  const user = await getSupabaseUserFromToken(h.slice(7).trim());
+  if (!user) { res.status(401).json({ error: VAULT_AUTH_ERROR }); return null; }
+  return user;
+}
+function isTableMissingStatus(status, bodyText) {
+  /* PostgREST answers table-not-found as 404 with code PGRST205. */
+  return status === 404 || (typeof bodyText === "string" && bodyText.indexOf("PGRST205") !== -1);
+}
+async function supabaseVaultRequest(path, method, body) {
+  const headers = {
+    apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY,
+    "Content-Type": "application/json",
+  };
+  const opts = { method: method, headers: headers, signal: AbortSignal.timeout(10000) };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  return fetch(SUPABASE_URL + path, opts);
+}
+async function extractDocumentText(mime, buffer) {
+  /* Server-side text extraction for vault uploads and /hr-audit files.
+     pdf-parse v2 is a class (new PDFParse({data}).getText()); the v1
+     function call is kept as a fallback. mammoth extractRawText for
+     DOCX. Plain text is returned as-is. Returns "" when nothing could
+     be read — the route turns that into the friendly 400. */
+  if (mime === "text/plain") return buffer.toString("utf8");
+  if (mime === "application/pdf") {
+    const pdfParse = require("pdf-parse");
+    if (pdfParse && pdfParse.PDFParse) {
+      const parser = new pdfParse.PDFParse({ data: buffer });
+      try {
+        const result = await parser.getText();
+        if (result && typeof result.text === "string") return result.text;
+        if (result && Array.isArray(result.pages)) return result.pages.map(function (p) { return p.text || ""; }).join("\n");
+        return "";
+      } finally {
+        try { await parser.destroy(); } catch (e) { /* ignore */ }
+      }
+    }
+    const data = await pdfParse(buffer);
+    return (data && data.text) || "";
+  }
+  if (mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    const mammoth = require("mammoth");
+    const result = await mammoth.extractRawText({ buffer: buffer });
+    return (result && result.value) || "";
+  }
+  return "";
+}
+async function loadVaultContext(userId) {
+  /* Loads the caller's vault docs (newest first) for the AI prompt,
+     truncated to VAULT_CONTEXT_MAX_CHARS in total. Fail-open: a
+     missing table or any load failure means NES baselines only — it
+     must never fail the check itself. Returns { context, tableMissing }. */
+  if (!userId || !process.env.SUPABASE_SERVICE_ROLE_KEY) return { context: "", tableMissing: false };
+  try {
+    const res = await supabaseVaultRequest("/rest/v1/company_policies?select=file_name,extracted_text&user_id=eq." + encodeURIComponent(userId) + "&order=created_at.desc&limit=" + VAULT_MAX_DOCS, "GET");
+    if (!res.ok) {
+      let bodyText = "";
+      try { bodyText = await res.text(); } catch (e) { bodyText = ""; }
+      return { context: "", tableMissing: isTableMissingStatus(res.status, bodyText) };
+    }
+    const rows = await res.json().catch(function () { return null; });
+    if (!Array.isArray(rows)) return { context: "", tableMissing: false };
+    let used = 0;
+    const parts = [];
+    for (let i = 0; i < rows.length; i++) {
+      const text = typeof rows[i].extracted_text === "string" ? rows[i].extracted_text : "";
+      if (!text.trim()) continue;
+      const remaining = VAULT_CONTEXT_MAX_CHARS - used;
+      if (remaining <= 0) break;
+      const chunk = text.slice(0, remaining);
+      parts.push("--- " + (rows[i].file_name || "document") + " ---\n" + chunk);
+      used += chunk.length;
+    }
+    return { context: parts.join("\n\n"), tableMissing: false };
+  } catch (e) { return { context: "", tableMissing: false }; }
+}
+async function getSignedInUserId(req) {
+  /* Best-effort caller id for vault loading on the HR routes (guests
+     have no vault). Fails open to null — a bad token is already
+     ignored by the limit checks. */
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) return null;
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) return null;
+  const user = await getSupabaseUserFromToken(h.slice(7).trim());
+  return user ? user.id : null;
+}
+async function runHrProvider(provider, prompt, userText) {
+  /* Runs one HR prompt through the selected provider and returns the
+     raw JSON text. Throws an Error with .status for upstream failures
+     so the route maps it with mapVisionUpstreamError. */
+  if (provider.provider === "gemini") {
+    return callGeminiText(prompt + "\n\n" + userText);
+  }
+  if (!client) throw Object.assign(new Error("AI service is not configured"), { status: 0 });
+  const response = await client.chat.completions.create({
+    model: OPENAI_TEXT_MODEL,
+    response_format: { type: "json_object" },
+    temperature: 0.7,
+    messages: [
+      { role: "system", content: prompt },
+      { role: "user", content: userText },
+    ],
+  });
+  const raw = response && response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content : null;
+  if (!raw) throw new Error("No result returned");
+  return raw;
+}
+
+/* ---------- Company Vault ---------- */
+app.post("/vault/upload", async (req, res) => {
+  try {
+    const user = await requireVaultUser(req, res);
+    if (!user) return; /* 401 already sent */
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: VAULT_NOT_SETUP_ERROR });
+    }
+    const body = req.body || {};
+    const fileName = typeof body.file_name === "string" ? body.file_name.trim().slice(0, 200) : "";
+    if (!fileName) return res.status(400).json({ error: "Add a file name to upload a document." });
+    if (!VAULT_DOC_TYPES.includes(body.doc_type)) {
+      return res.status(400).json({ error: "Choose a document type: handbook, contract, policy or other." });
+    }
+    if (!VAULT_MIMES.includes(body.mime)) {
+      return res.status(400).json({ error: "Only PDF, DOCX or plain text documents can be uploaded." });
+    }
+    if (typeof body.data_base64 !== "string" || !body.data_base64.trim()) {
+      return res.status(400).json({ error: "Add a file to upload." });
+    }
+    const buffer = Buffer.from(body.data_base64, "base64");
+    if (!buffer.length) return res.status(400).json({ error: "We couldn't read that file." });
+    if (buffer.length > VAULT_MAX_FILE_BYTES) {
+      return res.status(413).json({ error: VAULT_FILE_TOO_LARGE_ERROR });
+    }
+    let text = "";
+    try { text = await extractDocumentText(body.mime, buffer); } catch (e) { text = ""; }
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "We couldn't read any text from that file." });
+    }
+    text = text.trim();
+    /* Max 10 documents per user — count first, then insert. */
+    const countRes = await supabaseVaultRequest("/rest/v1/company_policies?select=id&user_id=eq." + encodeURIComponent(user.id) + "&limit=" + (VAULT_MAX_DOCS + 1), "GET");
+    if (!countRes.ok) {
+      let bodyText = "";
+      try { bodyText = await countRes.text(); } catch (e) { bodyText = ""; }
+      if (isTableMissingStatus(countRes.status, bodyText)) return res.status(503).json({ error: VAULT_NOT_SETUP_ERROR });
+      return res.status(500).json({ error: "Something went wrong. Please try again." });
+    }
+    const existing = await countRes.json().catch(function () { return null; });
+    if (Array.isArray(existing) && existing.length >= VAULT_MAX_DOCS) {
+      return res.status(409).json({ error: VAULT_FULL_ERROR });
+    }
+    const insertRes = await fetch(SUPABASE_URL + "/rest/v1/company_policies", {
+      method: "POST",
+      headers: {
+        apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: "Bearer " + process.env.SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify({ user_id: user.id, file_name: fileName, doc_type: body.doc_type, extracted_text: text }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!insertRes.ok) {
+      let bodyText = "";
+      try { bodyText = await insertRes.text(); } catch (e) { bodyText = ""; }
+      if (isTableMissingStatus(insertRes.status, bodyText)) return res.status(503).json({ error: VAULT_NOT_SETUP_ERROR });
+      console.error("Vault upload failed:", insertRes.status);
+      return res.status(500).json({ error: "Something went wrong. Please try again." });
+    }
+    const rows = await insertRes.json().catch(function () { return null; });
+    const row = Array.isArray(rows) && rows[0] ? rows[0] : null;
+    return res.json({
+      id: row && row.id ? row.id : null,
+      file_name: fileName,
+      doc_type: body.doc_type,
+      chars: text.length,
+      created_at: row && row.created_at ? row.created_at : new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("Vault upload error");
+    return res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+app.get("/vault/list", async (req, res) => {
+  try {
+    const user = await requireVaultUser(req, res);
+    if (!user) return; /* 401 already sent */
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: VAULT_NOT_SETUP_ERROR });
+    }
+    const listRes = await supabaseVaultRequest("/rest/v1/company_policies?select=id,file_name,doc_type,created_at,extracted_text&user_id=eq." + encodeURIComponent(user.id) + "&order=created_at.desc&limit=" + VAULT_MAX_DOCS, "GET");
+    if (!listRes.ok) {
+      let bodyText = "";
+      try { bodyText = await listRes.text(); } catch (e) { bodyText = ""; }
+      if (isTableMissingStatus(listRes.status, bodyText)) return res.status(503).json({ error: VAULT_NOT_SETUP_ERROR });
+      return res.status(500).json({ error: "Something went wrong. Please try again." });
+    }
+    const rows = await listRes.json().catch(function () { return null; });
+    const documents = (Array.isArray(rows) ? rows : []).map(function (r) {
+      return {
+        id: r.id,
+        file_name: r.file_name,
+        doc_type: r.doc_type,
+        created_at: r.created_at,
+        chars: typeof r.extracted_text === "string" ? r.extracted_text.length : 0,
+      };
+    });
+    return res.json({ documents: documents });
+  } catch (e) {
+    console.error("Vault list error");
+    return res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+app.post("/vault/delete", async (req, res) => {
+  try {
+    const user = await requireVaultUser(req, res);
+    if (!user) return; /* 401 already sent */
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: VAULT_NOT_SETUP_ERROR });
+    }
+    const id = req.body && typeof req.body.id === "string" ? req.body.id.trim() : "";
+    if (!id) return res.status(400).json({ error: "Choose a document to delete." });
+    /* Idempotent: an unknown id still answers { deleted: true }. The
+       delete is scoped to id AND user_id, so nobody can delete
+       another user's document. */
+    const delRes = await supabaseVaultRequest("/rest/v1/company_policies?id=eq." + encodeURIComponent(id) + "&user_id=eq." + encodeURIComponent(user.id), "DELETE");
+    if (!delRes.ok) {
+      let bodyText = "";
+      try { bodyText = await delRes.text(); } catch (e) { bodyText = ""; }
+      if (isTableMissingStatus(delRes.status, bodyText)) return res.status(503).json({ error: VAULT_NOT_SETUP_ERROR });
+    }
+    return res.json({ deleted: true });
+  } catch (e) {
+    console.error("Vault delete error");
+    return res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+/* ---------- HR Guardrail + Contract & Policy Auditor ----------
+   Same guards as /analyze-thread: validate input, signed-in daily
+   limit, guest 5/hour, Turnstile, then the provider (MOCK_AI ->
+   Gemini -> OpenAI). No cache for HR results. */
+app.use("/hr-guardrail", optionalAuth);
+app.use("/hr-guardrail", limiter);
+app.post("/hr-guardrail", analyzeLimiter, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const draft = typeof body.draft === "string" ? body.draft.trim() : "";
+    if (!draft) return res.status(400).json({ error: "Add a draft to check." });
+    if (draft.length > HR_GUARDRAIL_MAX_DRAFT_CHARS) {
+      return res.status(400).json({ error: "That draft is too long. Please keep it under 5,000 characters." });
+    }
+    if (!HR_SCENARIOS.includes(body.scenario)) {
+      return res.status(400).json({ error: "Choose a scenario: Performance & Warnings, Leave & Roster Changes, Termination & Redundancy, or Contractor & Client Scope." });
+    }
+    if (body.jurisdiction !== "australia") {
+      return res.status(400).json({ error: "Australia is the only supported jurisdiction for now." });
+    }
+    const limitCheck = await checkSignedInDailyLimit(req);
+    if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
+    if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
+      return res.status(429).json({ error: GUEST_HOURLY_LIMIT_MESSAGE });
+    }
+    const turnstile = await verifyTurnstile(req);
+    if (turnstile) return res.status(turnstile.status).json({ error: turnstile.error });
+    const provider = selectHrProvider();
+    if (provider.provider === "none") {
+      return res.status(500).json({ error: "AI service is not configured." });
+    }
+    if (provider.provider === "mock") {
+      return res.json(formatGuardrailResult(buildMockGuardrailResult(body.scenario)));
+    }
+    const userId = await getSignedInUserId(req);
+    const vault = await loadVaultContext(userId); /* fail-open: NES baselines only on failure */
+    const prompt = buildGuardrailPrompt(draft, body.scenario, vault.context);
+    let raw;
+    try {
+      raw = await runHrProvider(provider, prompt, "Draft to check:\n" + draft);
+    } catch (error) {
+      if (error && error.status) console.error("HR guardrail provider error status:", error.status);
+      else console.error("HR guardrail error");
+      const mapped = mapVisionUpstreamError(error);
+      return res.status(mapped.status).json({ error: mapped.error });
+    }
+    if (!raw) return res.status(500).json({ error: "No result returned." });
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseError) {
+      console.error("JSON parse error:", parseError.message);
+      return res.status(500).json({ error: "AI returned invalid JSON." });
+    }
+    return res.json(formatGuardrailResult(parsed));
+  } catch (error) {
+    if (error && error.status) console.error("HR guardrail provider error status:", error.status);
+    else console.error("HR guardrail error");
+    const mapped = mapVisionUpstreamError(error);
+    return res.status(mapped.status).json({ error: mapped.error });
+  }
+});
+
+app.use("/hr-audit", optionalAuth);
+app.use("/hr-audit", limiter);
+app.post("/hr-audit", analyzeLimiter, async (req, res) => {
+  try {
+    const body = req.body || {};
+    let documentText = "";
+    if (typeof body.document_text === "string" && body.document_text.trim()) {
+      documentText = body.document_text.trim();
+      if (documentText.length > HR_AUDIT_MAX_TEXT_CHARS) {
+        return res.status(400).json({ error: "That document is too long. Please keep it under 20,000 characters." });
+      }
+    } else if (body.file && typeof body.file === "object") {
+      const file = body.file;
+      if (!["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"].includes(file.mime)) {
+        return res.status(400).json({ error: "Only PDF or DOCX files can be audited." });
+      }
+      if (typeof file.data_base64 !== "string" || !file.data_base64.trim()) {
+        return res.status(400).json({ error: "Add a file to audit." });
+      }
+      const buffer = Buffer.from(file.data_base64, "base64");
+      if (!buffer.length) return res.status(400).json({ error: "We couldn't read that file." });
+      if (buffer.length > VAULT_MAX_FILE_BYTES) {
+        return res.status(413).json({ error: VAULT_FILE_TOO_LARGE_ERROR });
+      }
+      try { documentText = (await extractDocumentText(file.mime, buffer) || "").trim(); } catch (e) { documentText = ""; }
+      if (!documentText) {
+        return res.status(400).json({ error: "We couldn't read any text from that file." });
+      }
+    } else {
+      return res.status(400).json({ error: "Add the contract or policy text, or upload a PDF or DOCX file to audit." });
+    }
+    const limitCheck = await checkSignedInDailyLimit(req);
+    if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
+    if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
+      return res.status(429).json({ error: GUEST_HOURLY_LIMIT_MESSAGE });
+    }
+    const turnstile = await verifyTurnstile(req);
+    if (turnstile) return res.status(turnstile.status).json({ error: turnstile.error });
+    const provider = selectHrProvider();
+    if (provider.provider === "none") {
+      return res.status(500).json({ error: "AI service is not configured." });
+    }
+    if (provider.provider === "mock") {
+      return res.json(formatAuditResult(buildMockAuditResult()));
+    }
+    const userId = await getSignedInUserId(req);
+    const vault = await loadVaultContext(userId); /* fail-open: NES baselines only on failure */
+    const prompt = buildAuditPrompt(documentText, vault.context);
+    let raw;
+    try {
+      raw = await runHrProvider(provider, prompt, "Document to audit:\n" + documentText);
+    } catch (error) {
+      if (error && error.status) console.error("HR audit provider error status:", error.status);
+      else console.error("HR audit error");
+      const mapped = mapVisionUpstreamError(error);
+      return res.status(mapped.status).json({ error: mapped.error });
+    }
+    if (!raw) return res.status(500).json({ error: "No result returned." });
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseError) {
+      console.error("JSON parse error:", parseError.message);
+      return res.status(500).json({ error: "AI returned invalid JSON." });
+    }
+    return res.json(formatAuditResult(parsed));
+  } catch (error) {
+    if (error && error.status) console.error("HR audit provider error status:", error.status);
+    else console.error("HR audit error");
+    const mapped = mapVisionUpstreamError(error);
+    return res.status(mapped.status).json({ error: mapped.error });
   }
 });
 
