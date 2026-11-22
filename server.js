@@ -1696,7 +1696,11 @@ async function verifyTurnstile(req) {
     signal: AbortSignal.timeout(10000),
   });
   const turnstileResult = await turnstileResponse.json().catch(function () { return null; });
-  if (!turnstileResult || !turnstileResult.success) return { status: 403, error: "Verification failed. Please try again." };
+  if (!turnstileResult || !turnstileResult.success) {
+    const codes = turnstileResult && Array.isArray(turnstileResult["error-codes"]) ? turnstileResult["error-codes"].join(",") : "unknown";
+    console.error("Turnstile verify failed:", codes);
+    return { status: 403, error: "Verification failed. Please try again." };
+  }
   return null;
 }
 async function requireVaultUser(req, res) {
@@ -1798,7 +1802,13 @@ async function runHrProvider(provider, prompt, userText) {
      raw JSON text. Throws an Error with .status for upstream failures
      so the route maps it with mapVisionUpstreamError. */
   if (provider.provider === "gemini") {
-    return callGeminiText(prompt + "\n\n" + userText);
+    try {
+      return await callGeminiText(prompt + "\n\n" + userText);
+    } catch (geminiError) {
+      console.error("HR Gemini failed, falling back to OpenAI:", geminiError && geminiError.message ? geminiError.message : geminiError);
+      if (!client) throw geminiError;
+      provider = { provider: "openai", model: OPENAI_TEXT_MODEL };
+    }
   }
   if (!client) throw Object.assign(new Error("AI service is not configured"), { status: 0 });
   const response = await client.chat.completions.create({
@@ -1988,8 +1998,8 @@ app.post("/hr-guardrail", analyzeLimiter, async (req, res) => {
     try {
       raw = await runHrProvider(provider, prompt, "Draft to check:\n" + draft);
     } catch (error) {
-      if (error && error.status) console.error("HR guardrail provider error status:", error.status);
-      else console.error("HR guardrail error");
+      if (error && error.status) console.error("HR guardrail provider error status:", error.status, error.message || "");
+      else console.error("HR guardrail error:", error && error.message ? error.message : error);
       const mapped = mapVisionUpstreamError(error);
       return res.status(mapped.status).json({ error: mapped.error });
     }
@@ -2003,8 +2013,8 @@ app.post("/hr-guardrail", analyzeLimiter, async (req, res) => {
     }
     return res.json(formatGuardrailResult(parsed));
   } catch (error) {
-    if (error && error.status) console.error("HR guardrail provider error status:", error.status);
-    else console.error("HR guardrail error");
+    if (error && error.status) console.error("HR guardrail provider error status:", error.status, error.message || "");
+    else console.error("HR guardrail error:", error && error.message ? error.message : error);
     const mapped = mapVisionUpstreamError(error);
     return res.status(mapped.status).json({ error: mapped.error });
   }
@@ -2062,8 +2072,8 @@ app.post("/hr-audit", analyzeLimiter, async (req, res) => {
     try {
       raw = await runHrProvider(provider, prompt, "Document to audit:\n" + documentText);
     } catch (error) {
-      if (error && error.status) console.error("HR audit provider error status:", error.status);
-      else console.error("HR audit error");
+      if (error && error.status) console.error("HR audit provider error status:", error.status, error.message || "");
+      else console.error("HR audit error:", error && error.message ? error.message : error);
       const mapped = mapVisionUpstreamError(error);
       return res.status(mapped.status).json({ error: mapped.error });
     }
@@ -2077,8 +2087,8 @@ app.post("/hr-audit", analyzeLimiter, async (req, res) => {
     }
     return res.json(formatAuditResult(parsed));
   } catch (error) {
-    if (error && error.status) console.error("HR audit provider error status:", error.status);
-    else console.error("HR audit error");
+    if (error && error.status) console.error("HR audit provider error status:", error.status, error.message || "");
+    else console.error("HR audit error:", error && error.message ? error.message : error);
     const mapped = mapVisionUpstreamError(error);
     return res.status(mapped.status).json({ error: mapped.error });
   }
