@@ -447,7 +447,7 @@ function mapVisionUpstreamError(error) {
   if (error && error.name === "AbortError") return { status: 502, error: VISION_UPSTREAM_ERROR };
   return { status: 500, error: "Something went wrong. Please try again." };
 }
-async function callGeminiVision(prompt, images) {
+async function callGeminiVision(prompt, images, schema) {
   /* Sprint 2 fix pass: Gemini via plain fetch — no new npm dependency.
      Images go as inline_data parts (mime_type + base64); the model must
      return JSON (responseMimeType application/json). Throws an Error with
@@ -457,10 +457,12 @@ async function callGeminiVision(prompt, images) {
     const m = url.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
     if (m) parts.push({ inline_data: { mime_type: "image/" + m[1], data: m[2] } });
   });
+  const generationConfig = { responseMimeType: "application/json", temperature: 0.7 };
+  if (schema) generationConfig.responseSchema = schema;
   const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_VISION_MODEL + ":generateContent?key=" + encodeURIComponent(process.env.GEMINI_API_KEY || ""), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ parts: parts }], generationConfig: { responseMimeType: "application/json", temperature: 0.7 } }),
+    body: JSON.stringify({ contents: [{ parts: parts }], generationConfig: generationConfig }),
     signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) { const e = new Error("Gemini request failed"); e.status = res.status; throw e; }
@@ -1527,82 +1529,100 @@ function sanitiseRizzContext(value) {
   if (v.length > RIZZ_CONTEXT_MAX_CHARS) return { error: "Keep the context under 280 characters." };
   return { value: v };
 }
-function buildRizzPrompt(text, styleSample, opts) {
-  const o = opts || {};
-  const styleLine = (styleSample && !o.styleExamples) ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
-  const personLine = o.personContext ? "\nThis message is for: " + o.personContext + " — write replies that fit that person and what you know about them.\n" : "";
-  const examplesLine = o.styleExamples ? "\nHere are real texts the user actually sent — copy their voice exactly (punctuation, capitalisation, length, slang):\n" + o.styleExamples + "\n" : "";
-  const contextLine = o.context ? "\nContext: " + o.context + "\n" : "";
-  return `You are BeforeYouSay Rizz Check — a playful Gen Z wingman that rates a DM or text before it gets sent.
-Rate this message for rizz (charm, flirt game, smoothness):
----
-${text}
----${styleLine}${personLine}${examplesLine}${contextLine}
-Return valid JSON only in this exact structure:
-{
-  "score": 0-100,
-  "label": "Dry texter | Needs work | Mid but trying | Smooth | Certified smooth",
-  "roast": "string — one playful roast of the message, 1-2 lines",
-  "signal": "string — one line on what the message actually signals to the other person",
-  "tip": "string — one line: what the user should do differently next time",
-  "verdict": "send | tweak | wait | dont — whether the user should send this message as written",
-  "lands": "string — one line on how the message reads to the recipient",
-  "dontSend": "string — one line naming the specific thing NOT to send or do, or an empty string if there is nothing specific",
-  "replies": [
-    { "style": "smooth", "text": "string — a smoother version of the same message, sendable as written" },
-    { "style": "funny", "text": "string — a funnier version of the same message, sendable as written" },
-    { "style": "chill", "text": "string — a chiller, more laid-back version of the same message, sendable as written" }
-  ]
+/* Five-changes-v2: the check-result JSON schema. Sagar's verbatim
+   prompt says "Return only JSON matching the schema" — this is the
+   schema it means. OpenAI gets it via response_format json_schema
+   (strict); Gemini gets the same shape minus additionalProperties,
+   which its responseSchema does not accept. The schema cannot
+   express the conditional rule (replies [] when verdict is dont,
+   exactly 3 otherwise) — formatRizzResult enforces that. */
+const CHECK_RESULT_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    score: { type: "integer", minimum: 0, maximum: 100 },
+    label: { type: "string" },
+    verdict: { type: "string", enum: ["send", "tweak", "wait", "dont"] },
+    lands: { type: "string" },
+    signal: { type: "string" },
+    tip: { type: "string" },
+    dontSend: { type: "string" },
+    roast: { type: "string" },
+    replies: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          style: { type: "string", enum: ["smooth", "funny", "chill"] },
+          text: { type: "string" }
+        },
+        required: ["style", "text"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["score", "label", "verdict", "lands", "signal", "tip", "dontSend", "roast", "replies"],
+  additionalProperties: false
+};
+function stripSchemaAdditionalProperties(schema) {
+  if (Array.isArray(schema)) return schema.map(stripSchemaAdditionalProperties);
+  if (!schema || typeof schema !== "object") return schema;
+  const out = {};
+  Object.keys(schema).forEach(function (k) {
+    if (k === "additionalProperties") return;
+    out[k] = stripSchemaAdditionalProperties(schema[k]);
+  });
+  return out;
 }
-Rules:
-- Score honestly: a dry "hey" or one-word reply is 0-20; a confident, specific, playful opener with a question or a hook is 61-100.
-- The roast is light and funny, never cruel. Never mock someone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
-- Never help the user deceive, harass, manipulate, or cheat anyone.
-- Both replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
-- Write like a real person texting, not a corporate email or a therapy session. No cliches ("at the end of the day", "just checking in", "circle back"), no therapy-speak ("I hear you", "holding space"), no LinkedIn voice, no metaphors, no paragraphs. No exclamation-mark overload — at most one exclamation mark across all three replies, and usually none.
-- The "chill" reply must be under 12 words. All replies stay short, slightly imperfect, and lowercase-friendly — real texting, not a polished speech.
-- Return verdict "dont" when the message should not be sent at all — for example texting someone who told them no, a blocked contact, or a third unanswered message in a row. Say so plainly in "lands" and name the specific thing to avoid in "dontSend".
-- Keep the roast, the signal and the tip short — this is a quick check, not an essay.`;
+const CHECK_RESULT_GEMINI_SCHEMA = stripSchemaAdditionalProperties(CHECK_RESULT_JSON_SCHEMA);
+function buildRizzPrompt(text, styleSample, opts) {
+  /* Five-changes-v2: rizz is just a mode now — the same verbatim
+     prompt as every other mode. Kept as a separate function so the
+     old call shape still finds it. */
+  return buildModePrompt("rizz", text, styleSample, opts);
 }
 function buildModePrompt(mode, text, styleSample, opts) {
-  if (mode === "rizz" || !RIZZ_MODE_DEFS[mode]) return buildRizzPrompt(text, styleSample, opts);
-  const def = RIZZ_MODE_DEFS[mode];
+  /* Five-changes-v2: ONE prompt for every mode — Sagar's verbatim
+     system prompt. The mode line tells the model which job to judge;
+     the job list inside the prompt does the rest. opts.noDraft skips
+     the draft block (the screenshot route has no draft text — the
+     image is the draft). The prompt text lives inside this function
+     on purpose: the logic tests extract this function and run it
+     standalone, so it cannot read a module-level const. */
+  const m = mode === "shot" ? "shot" : (RIZZ_MODE_DEFS[mode] ? mode : "rizz");
   const o = opts || {};
   const styleLine = (styleSample && !o.styleExamples) ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
   const personLine = o.personContext ? "\nThis message is for: " + o.personContext + " — write replies that fit that person and what you know about them.\n" : "";
   const examplesLine = o.styleExamples ? "\nHere are real texts the user actually sent — copy their voice exactly (punctuation, capitalisation, length, slang):\n" + o.styleExamples + "\n" : "";
   const contextLine = o.context ? "\nContext: " + o.context + "\n" : "";
-  const labels = def.bands.map(function (b) { return b.label; }).join(" | ");
-  return `You are BeforeYouSay — a playful Gen Z texting coach that helps people sound like themselves, only better.
-${def.task}:
----
-${text}
----${styleLine}${personLine}${examplesLine}${contextLine}
-Return valid JSON only in this exact structure:
-{
-  "score": 0-100,
-  "label": "${labels}",
-  "roast": "string — ${def.roastRole}",
-  "signal": "string — ${def.signalRole}",
-  "tip": "string — one line: what the user should do differently next time",
-  "verdict": "send | tweak | wait | dont — whether the user should send this message as written",
-  "lands": "string — one line on how the message reads to the recipient",
-  "dontSend": "string — one line naming the specific thing NOT to send or do, or an empty string if there is nothing specific",
-  "replies": [
-    { "style": "smooth", "text": "string — ${def.replyRoles[0]}, sendable as written" },
-    { "style": "funny", "text": "string — ${def.replyRoles[1]}, sendable as written" },
-    { "style": "chill", "text": "string — ${def.replyRoles[2]}, sendable as written" }
-  ]
-}
-Rules:
-- Score honestly: ${def.scoreGuide}
-- The roast is light and funny, never cruel. Never mock someone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
-- Never help the user deceive, harass, manipulate, or cheat anyone. An apology must be genuine: own the mistake, no blame-shifting, no excuses, no guilt-tripping the other person.
-- All three replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
-- Write like a real person texting, not a corporate email or a therapy session. No cliches ("at the end of the day", "just checking in", "circle back"), no therapy-speak ("I hear you", "holding space"), no LinkedIn voice, no metaphors, no paragraphs. No exclamation-mark overload — at most one exclamation mark across all three replies, and usually none.
-- The "chill" reply must be under 12 words. All replies stay short, slightly imperfect, and lowercase-friendly — real texting, not a polished speech.
-- Return verdict "dont" when the message should not be sent at all — for example texting someone who told them no, a blocked contact, or a third unanswered message in a row. Say so plainly in "lands" and name the specific thing to avoid in "dontSend".
-- Keep the roast, the signal and the tip short — this is a quick check, not an essay.`;
+  const draftBlock = o.noDraft ? "" : "\nThe draft to judge:\n---\n" + text + "\n---";
+  return `You are the check before someone hits send. You are not a pickup-line writer.
+Return only JSON matching the schema. No markdown.
+
+Judge the draft for THIS job, not for charm:
+- rizz, reply, opener, dry: would this get a reply without sounding try-hard or needy?
+- apology: one real apology, no excuse stacked on it, then stop.
+- calm, deescalate: lower the heat. Do not win the argument.
+- work: clear, professional, short. No jokes, no emoji, no flirting.
+- boundary: a clear no. Warm is fine. A guilt paragraph is a fail.
+- practice: score their reply against the scenario in context.
+
+verdict is required. send = they can send it. tweak = one fix. wait = wrong moment. dont = do not send, and say why in dontSend.
+Use dont, with empty replies, if the other person is a minor, has asked for no contact, or the user wants to guilt, threaten, or manipulate them.
+
+score is 0-100 for the job above. label is 2-4 words for that job. Do not use the word rizz unless the mode is rizz.
+lands: one sentence on how the other person will read it.
+signal: what the draft actually communicates.
+tip: one concrete next-time rule.
+roast: one dry sentence about the draft. No names, no body, no sexual joke. Empty string unless the mode is rizz or dry.
+
+replies: exactly 3, each a different move, each something this person would actually send.
+Match styleExamples if present: same length, same caps, same emoji. Do not upgrade their grammar.
+If styleExamples is empty, match styleSample loosely and stay plain.
+Reply 1 is specific and easy to answer. Reply 2 uses their actual words, or is the warmer version when the mode is apology, work, or boundary. Reply 3 is shorter than the draft and low pressure.
+If verdict is dont, replies is [].
+Never write a paragraph in answer to a sentence.
+
+Mode: ${m}${styleLine}${personLine}${examplesLine}${contextLine}${draftBlock}`;
 }
 function buildMockRizzResult() {
   /* MOCK_AI canned sample — schema-valid, clearly a sample. */
@@ -1629,7 +1649,7 @@ function buildMockModeResult(mode) {
     case "reply":
       return {
         score: 68, label: "Into it",
-        roast: "They asked you a question back — that is not an accident, that is interest.",
+        roast: "",
         signal: "They are keeping the conversation going on purpose, not just being polite.",
         tip: "Answer what they asked, then ask one thing back — it keeps the ball rolling.",
     verdict: "send",
@@ -1645,7 +1665,7 @@ function buildMockModeResult(mode) {
     case "opener":
       return {
         score: 64, label: "Strong opener",
-        roast: "Specific, confident, and it actually gives them something to answer — rare for a first text.",
+        roast: "",
         signal: "It reads like you noticed something real about them, not a copy-paste opener.",
         tip: "Keep the next one just as specific — generic is where openers go to die.",
     verdict: "send",
@@ -1661,7 +1681,7 @@ function buildMockModeResult(mode) {
     case "apology":
       return {
         score: 74, label: "Genuinely sorry",
-        roast: "You owned it, no excuses, no \"but\" — that is how an apology is supposed to sound.",
+        roast: "",
         signal: "It reads sincere, not like you are trying to get yourself off the hook.",
         tip: "Send it once, then give them space — repeating the apology makes it about you.",
     verdict: "send",
@@ -1684,16 +1704,12 @@ function buildMockModeResult(mode) {
     lands: "Three unanswered texts in a row — this one reads desperate.",
     dontSend: "Don't send the double text — you already messaged twice with no reply.",
         mode: "dry",
-        replies: [
-          { style: "smooth", text: "Okay, that came out drier than I meant — what are you up to this weekend?" },
-          { style: "funny", text: "I just reread my last text and honestly, I would have left me on read too. How's your day going?" },
-          { style: "chill", text: "haha sorry, that was dry — what are you up to?" },
-        ],
+        replies: [],
       };
     case "calm":
       return {
         score: 80, label: "Very heated",
-        roast: "This is a text you would regret by morning — all heat, no point.",
+        roast: "",
         signal: "It reads like an attack, so they will get defensive instead of sorry.",
         tip: "Write the angry version, wait ten minutes, then send the calm one.",
         verdict: "wait",
@@ -1709,7 +1725,7 @@ function buildMockModeResult(mode) {
     case "work":
       return {
         score: 70, label: "Professional",
-        roast: "Short, clear, one ask — your boss can answer this in ten seconds.",
+        roast: "",
         signal: "It reads competent and easy to say yes to.",
         tip: "One ask per message — two asks in one text get half an answer.",
         verdict: "send",
@@ -1718,14 +1734,14 @@ function buildMockModeResult(mode) {
         mode: "work",
         replies: [
           { style: "smooth", text: "Hi — quick one: could you approve the leave request by Friday? Happy to cover the handover." },
-          { style: "funny", text: "Hi! Small favour — could you approve my leave by Friday? I promise the handover notes will be beautiful." },
+          { style: "funny", text: "Hi — could you approve my leave by Friday? I have the handover notes ready for you." },
           { style: "chill", text: "hey, could you approve my leave by friday? handover notes are ready." },
         ],
       };
     case "boundary":
       return {
         score: 72, label: "Clear and firm",
-        roast: "Short, one reason, full stop — that is how a no is supposed to sound.",
+        roast: "",
         signal: "It reads firm without sounding rude.",
         tip: "A good no is short: say no, give one reason, stop there.",
         verdict: "send",
@@ -1734,14 +1750,14 @@ function buildMockModeResult(mode) {
         mode: "boundary",
         replies: [
           { style: "smooth", text: "Thanks for thinking of me, but I can't take that shift on — I need the weekend off." },
-          { style: "funny", text: "I appreciate the ask, but my weekend is already booked — by me, doing nothing. Next time?" },
+          { style: "funny", text: "I appreciate the ask — I need the weekend off this time, but thank you for thinking of me." },
           { style: "chill", text: "sorry, can't do this one — need the weekend off." },
         ],
       };
     case "deescalate":
       return {
         score: 69, label: "Calming",
-        roast: "You heard them first and kept it calm — that is the whole trick.",
+        roast: "",
         signal: "It reads like you want to fix it, not win it.",
         tip: "Acknowledge how they feel first — people cannot hear your point until they feel heard.",
         verdict: "send",
@@ -1757,7 +1773,7 @@ function buildMockModeResult(mode) {
     case "practice":
       return {
         score: 76, label: "Strong reply",
-        roast: "You said the hard thing without making it a fight — that is the whole skill.",
+        roast: "",
         signal: "It reads steady, not defensive.",
         tip: "Practice again tomorrow — small daily reps are how texting gets easier.",
         verdict: "send",
@@ -1775,66 +1791,63 @@ function buildMockModeResult(mode) {
   }
 }
 function formatRizzResult(data, mode) {
-  /* Normalise any provider answer into the strict rizz shape. The
-     label is always recomputed from the score and the mode, so it can
-     never disagree with either. A missing or invalid piece falls back
-     to a safe neutral value, never a crash. Mode defaults to "rizz"
-     when it is missing or unknown — the old call shape still works.
-     The band/tip lookups below are written as short-circuit
-     ternaries on purpose: a default-mode call only ever reads
-     RIZZ_LABELS, so the function also works standalone (the Pivot 3
-     logic test extracts it without the mode tables). */
+  /* Five-changes-v2: strict validation, not a fallback machine.
+     The provider answer must match the schema (score, label,
+     verdict, lands, signal, tip, dontSend, roast, replies). If
+     anything is missing, mistyped, or out of range, this returns
+     null — the route retries the model once, then answers 500.
+     Nothing is invented: no "Tweak it" default, no filled-in tip,
+     no invented replies. The label is still recomputed from the
+     score and the mode's bands, so it can never disagree with the
+     score. A "dont" verdict forces replies to []. Roast is kept
+     only for rizz/dry modes; every other mode gets "".
+     Note on the 2-4 word label rule: the prompt asks the model for
+     a 2-4 word label, but the displayed label is always the band
+     label for the score — and the band labels ("Smooth",
+     "Professional", "Calming", "Warm") are one word by design.
+     So the server validates that a label string is present and
+     then replaces it with the band label; it does not reject a
+     1-word model label, because the band label is what the user
+     sees. */
   const m = typeof mode === "string" && mode !== "rizz" && mode !== "shot" ? (RIZZ_MODE_DEFS[mode] ? mode : "rizz") : (mode === "shot" ? "shot" : "rizz");
-  const score = Math.min(100, Math.max(0, Math.round(Number(data && data.score) || 0)));
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  if (typeof data.score !== "number" || !Number.isFinite(data.score)) return null;
+  const score = Math.round(data.score);
+  if (score < 0 || score > 100) return null;
   const bands = m === "shot" ? SHOT_BANDS : (m === "rizz" ? RIZZ_LABELS : RIZZ_MODE_DEFS[m].bands);
   let label = bands[bands.length - 1].label;
   for (let i = 0; i < bands.length; i++) if (score <= bands[i].max) { label = bands[i].label; break; }
-  const roast = typeof data?.roast === "string" && data.roast.trim()
-    ? data.roast.trim().slice(0, 280)
-    : "No strong read on this one — it's giving neutral energy.";
-  const signal = typeof data?.signal === "string" && data.signal.trim()
-    ? data.signal.trim().slice(0, 280)
-    : "It reads friendly, but it doesn't give the other person much to reply to.";
-  const tipFallback = m === "shot" ? SHOT_TIP_FALLBACK : (m === "rizz" ? "Next time, add one specific detail or a question — it gives the other person something to reply to." : RIZZ_MODE_DEFS[m].tipFallback);
-  const tip = typeof data?.tip === "string" && data.tip.trim()
-    ? data.tip.trim().slice(0, 280)
-    : tipFallback;
-  const verdictRaw = typeof data?.verdict === "string" ? data.verdict.trim().toLowerCase() : "";
-  const verdict = ["send", "tweak", "wait", "dont"].indexOf(verdictRaw) !== -1 ? verdictRaw : "tweak";
-  const lands = typeof data?.lands === "string" && data.lands.trim()
-    ? data.lands.trim().slice(0, 280)
-    : "It reads fine, but a small tweak would make it land better.";
-  const dontSend = typeof data?.dontSend === "string" && data.dontSend.trim()
-    ? data.dontSend.trim().slice(0, 200)
-    : "";
-  const FALLBACK_REPLIES = {
-    smooth: "Hey — saw your post and it made me smile. What are you up to this weekend?",
-    funny: "Okay, I admit it, I stared at this text for five minutes before sending it. How's your day going?",
-    chill: "hey, saw your post — what have you been up to lately?",
-  };
-  const given = Array.isArray(data && data.replies) ? data.replies : [];
-  function pickReply(style, index) {
-    const byStyle = given.find(function (r) { return r && r.style === style && typeof r.text === "string" && r.text.trim(); });
-    const r = byStyle || given[index];
-    const text = r && typeof r.text === "string" && r.text.trim() ? r.text.trim().slice(0, 280) : "";
-    return text || FALLBACK_REPLIES[style];
+  if (typeof data.label !== "string" || !data.label.trim()) return null;
+  const verdictRaw = typeof data.verdict === "string" ? data.verdict.trim().toLowerCase() : "";
+  if (["send", "tweak", "wait", "dont"].indexOf(verdictRaw) === -1) return null;
+  const verdict = verdictRaw;
+  function reqStr(v) { return typeof v === "string" && v.trim() ? v.trim().slice(0, 280) : null; }
+  const lands = reqStr(data.lands); if (lands === null) return null;
+  const signal = reqStr(data.signal); if (signal === null) return null;
+  const tip = reqStr(data.tip); if (tip === null) return null;
+  if (typeof data.dontSend !== "string") return null;
+  const dontSend = data.dontSend.trim().slice(0, 200);
+  if (typeof data.roast !== "string") return null;
+  const roast = (m === "rizz" || m === "dry") ? data.roast.trim().slice(0, 280) : "";
+  let replies;
+  if (verdict === "dont") {
+    replies = [];
+  } else {
+    if (!Array.isArray(data.replies) || data.replies.length !== 3) return null;
+    const byStyle = {};
+    for (let i = 0; i < data.replies.length; i++) {
+      const r = data.replies[i];
+      if (!r || typeof r !== "object" || ["smooth", "funny", "chill"].indexOf(r.style) === -1 || typeof r.text !== "string" || !r.text.trim()) return null;
+      byStyle[r.style] = r.text.trim().slice(0, 280);
+    }
+    if (!byStyle.smooth || !byStyle.funny || !byStyle.chill) return null;
+    replies = [
+      { style: "smooth", text: byStyle.smooth },
+      { style: "funny", text: byStyle.funny },
+      { style: "chill", text: byStyle.chill },
+    ];
   }
-  return {
-    score: score,
-    label: label,
-    roast: roast,
-    signal: signal,
-    tip: tip,
-    verdict: verdict,
-    lands: lands,
-    dontSend: dontSend,
-    mode: m,
-    replies: [
-      { style: "smooth", text: pickReply("smooth", 0) },
-      { style: "funny", text: pickReply("funny", 1) },
-      { style: "chill", text: pickReply("chill", 2) },
-    ],
-  };
+  return { score: score, label: label, roast: roast, signal: signal, tip: tip, verdict: verdict, lands: lands, dontSend: dontSend, mode: m, replies: replies };
 }
 app.use("/rizz", optionalAuth);
 app.use("/rizz", limiter);
@@ -1865,35 +1878,49 @@ app.post("/rizz", analyzeLimiter, async (req, res) => {
     }
     const turnstile = await verifyTurnstile(req);
     if (turnstile) return res.status(turnstile.status).json({ error: turnstile.error });
-    if (process.env.MOCK_AI === "true") return res.json(formatRizzResult(buildMockModeResult(mode), mode));
+    if (process.env.MOCK_AI === "true") {
+      const mock = formatRizzResult(buildMockModeResult(mode), mode);
+      if (!mock) return res.status(500).json({ error: "The check failed — please try again." });
+      return res.json(mock);
+    }
     if (!client) return res.status(500).json({ error: "AI service is not configured." });
-    let raw;
-    try {
-      const response = await client.chat.completions.create({
-        model: OPENAI_TEXT_MODEL,
-        response_format: { type: "json_object" },
-        temperature: 0.8,
-        messages: [
-          { role: "system", content: buildModePrompt(mode, text, styleSample.value, { personContext: personContext.value, styleExamples: styleExamples.value, context: context.value }) },
-          { role: "user", content: "Rate this DM:\n\n" + text },
-        ],
-      });
-      raw = response && response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content : null;
-    } catch (error) {
-      if (error && error.status) console.error("Rizz provider error status:", error.status, error.message || "");
-      else console.error("Rizz error:", error && error.message ? error.message : error);
-      const mapped = mapVisionUpstreamError(error);
-      return res.status(mapped.status).json({ error: mapped.error });
+    /* Five-changes-v2: the shape is forced with a JSON schema
+       (response_format json_schema, strict) and the answer is
+       validated server-side. A schema break retries the model call
+       ONCE; a second break answers 500. Nothing is invented. */
+    const rizzSystemPrompt = buildModePrompt(mode, text, styleSample.value, { personContext: personContext.value, styleExamples: styleExamples.value, context: context.value });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let raw;
+      try {
+        const response = await client.chat.completions.create({
+          model: OPENAI_TEXT_MODEL,
+          response_format: { type: "json_schema", json_schema: { name: "check_result", strict: true, schema: CHECK_RESULT_JSON_SCHEMA } },
+          temperature: 0.8,
+          messages: [
+            { role: "system", content: rizzSystemPrompt },
+            { role: "user", content: "Rate this DM:\n\n" + text },
+          ],
+        });
+        raw = response && response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content : null;
+      } catch (error) {
+        if (error && error.status) console.error("Rizz provider error status:", error.status, error.message || "");
+        else console.error("Rizz error:", error && error.message ? error.message : error);
+        const mapped = mapVisionUpstreamError(error);
+        return res.status(mapped.status).json({ error: mapped.error });
+      }
+      if (!raw) { console.error("Rizz empty model response (attempt " + (attempt + 1) + ")"); continue; }
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseError) {
+        console.error("JSON parse error:", parseError.message);
+        continue;
+      }
+      const formatted = formatRizzResult(parsed, mode);
+      if (formatted) return res.json(formatted);
+      console.error("Rizz result failed schema validation (attempt " + (attempt + 1) + ")");
     }
-    if (!raw) return res.status(500).json({ error: "No result returned." });
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (parseError) {
-      console.error("JSON parse error:", parseError.message);
-      return res.status(500).json({ error: "AI returned invalid JSON." });
-    }
-    return res.json(formatRizzResult(parsed, mode));
+    return res.status(500).json({ error: "The check failed — please try again." });
   } catch (error) {
     if (error && error.status) console.error("Rizz provider error status:", error.status, error.message || "");
     else console.error("Rizz error:", error && error.message ? error.message : error);
@@ -1932,46 +1959,21 @@ function sanitiseShotImage(image, mimeType) {
   if (decodedBytes > SHOT_MAX_IMAGE_BYTES) return { error: "That screenshot is too large — try a smaller one (max 2MB).", status: 413 };
   return { image: "data:" + mime + ";base64," + b64, mime: mime };
 }
-function buildShotPrompt(styleSample, opts) {
-  const o = opts || {};
-  const styleLine = (styleSample && !o.styleExamples) ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
-  const personLine = o.personContext ? "\nThis screenshot is about: " + o.personContext + " — write replies that fit that person and what you know about them.\n" : "";
-  const examplesLine = o.styleExamples ? "\nHere are real texts the user actually sent — copy their voice exactly (punctuation, capitalisation, length, slang):\n" + o.styleExamples + "\n" : "";
-  return `You are BeforeYouSay — a playful Gen Z texting coach that helps people sound like themselves, only better.
-Read this conversation screenshot and judge the vibe — who is interested, who is pulling away, and what the user should send back.
-${styleLine}${personLine}${examplesLine}
-Return valid JSON only in this exact structure:
-{
-  "score": 0-100,
-  "label": "Cold | Lukewarm | Warm | Hot | On fire",
-  "roast": "string — one line reading what is actually happening in the conversation",
-  "signal": "string — one line on what the other person is signalling",
-  "tip": "string — one line: what the user should do differently next time",
-  "verdict": "send | tweak | wait | dont — whether the user should send this message as written",
-  "lands": "string — one line on how the message reads to the recipient",
-  "dontSend": "string — one line naming the specific thing NOT to send or do, or an empty string if there is nothing specific",
-  "replies": [
-    { "style": "smooth", "text": "string — a smooth reply the user can send next, sendable as written" },
-    { "style": "funny", "text": "string — a funny reply the user can send next, sendable as written" },
-    { "style": "chill", "text": "string — a chill, low-pressure reply the user can send next, sendable as written" }
-  ]
-}
-Rules:
-- Score the vibe honestly: 0-20 = cold or uninterested, 61-100 = warm, engaged, and going somewhere.
-- The read is light and funny, never cruel. Never mock anyone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
-- Never help the user deceive, harass, manipulate, or cheat anyone.
-- All three replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
-- Write like a real person texting, not a corporate email or a therapy session. No cliches ("at the end of the day", "just checking in", "circle back"), no therapy-speak ("I hear you", "holding space"), no LinkedIn voice, no metaphors, no paragraphs. No exclamation-mark overload — at most one exclamation mark across all three replies, and usually none.
-- The "chill" reply must be under 12 words. All replies stay short, slightly imperfect, and lowercase-friendly — real texting, not a polished speech.
-- Return verdict "dont" when the message should not be sent at all — for example texting someone who told them no, a blocked contact, or a third unanswered message in a row. Say so plainly in "lands" and name the specific thing to avoid in "dontSend".
-- Keep the read, the signal and the tip short — this is a quick check, not an essay.`;
+function buildShotPrompt(styleSample, opts, mode) {
+  /* Five-changes-v2: the screenshot prompt is the same verbatim
+     system prompt, with the selected mode (default "shot") and no
+     draft block — the screenshot is the draft. The user message
+     carries the "answer the last bubble" instruction. */
+  const m = mode === "shot" || RIZZ_MODE_DEFS[mode] ? (mode || "shot") : "shot";
+  const o = Object.assign({}, opts || {}, { noDraft: true });
+  return buildModePrompt(m, "", styleSample, o);
 }
 function buildMockShotResult() {
   /* MOCK_AI canned sample — schema-valid, clearly a sample. */
   return {
     score: 58,
     label: "Warm",
-    roast: "They are asking questions back — that is not politeness, that is interest.",
+    roast: "",
     signal: "The conversation has momentum; they are matching your energy.",
     tip: "Reply to the last thing they said, then ask one question back.",
     verdict: "tweak",
@@ -1992,6 +1994,13 @@ app.post("/check-shot", analyzeLimiter, async (req, res) => {
     const body = req.body || {};
     const checked = sanitiseShotImage(body.image, body.mimeType);
     if (checked.error) return res.status(checked.status).json({ error: checked.error });
+    /* Five-changes-v2: the screenshot check takes an optional mode
+       (default "shot") and uses that mode's job/prompt; the
+       response echoes the selected mode. */
+    const shotMode = typeof body.mode === "string" && body.mode.trim() ? body.mode.trim() : "shot";
+    if (shotMode !== "shot" && !RIZZ_MODE_DEFS[shotMode]) {
+      return res.status(400).json({ error: "Pick a valid check mode." });
+    }
     const styleSample = sanitiseStyleSample(body.styleSample);
     if (styleSample.error) return res.status(400).json({ error: styleSample.error });
     const personContext = sanitisePersonContext(body.personContext);
@@ -2005,45 +2014,64 @@ app.post("/check-shot", analyzeLimiter, async (req, res) => {
     }
     const turnstile = await verifyTurnstile(req);
     if (turnstile) return res.status(turnstile.status).json({ error: turnstile.error });
-    if (process.env.MOCK_AI === "true") return res.json(formatRizzResult(buildMockShotResult(), "shot"));
+    if (process.env.MOCK_AI === "true") {
+      const mock = formatRizzResult(shotMode === "shot" ? buildMockShotResult() : buildMockModeResult(shotMode), shotMode);
+      if (!mock) return res.status(500).json({ error: "The check failed — please try again." });
+      return res.json(mock);
+    }
     const visionProvider = selectVisionProvider();
     if (visionProvider.provider === "none") {
       return res.status(500).json({ error: "AI service is not configured." });
     }
-    const shotPrompt = buildShotPrompt(styleSample.value, { personContext: personContext.value, styleExamples: styleExamples.value });
-    let raw = null;
-    if (visionProvider.provider === "gemini") {
-      raw = await callGeminiVision(shotPrompt, [checked.image]);
-    } else {
-      if (!client) {
-        return res.status(500).json({ error: "AI service is not configured." });
-      }
-      const response = await client.chat.completions.create({
-        model: visionProvider.model,
-        response_format: { type: "json_object" },
-        temperature: 0.7,
-        messages: [
-          { role: "system", content: shotPrompt },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "Read this conversation screenshot and tell me what is happening and what I should send back." },
-              { type: "image_url", image_url: { url: checked.image } },
+    const shotPrompt = buildShotPrompt(styleSample.value, { personContext: personContext.value, styleExamples: styleExamples.value }, shotMode);
+    const shotUserText = "Read this conversation screenshot and tell me what is happening and what I should send back. The user wants the next text they should send. Answer the last bubble. If you cannot tell who is who, set verdict to wait and leave replies empty.";
+    /* Five-changes-v2: same rule as /rizz — schema-forced shape,
+       server-side validation, one retry, then 500. */
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let raw = null;
+      try {
+        if (visionProvider.provider === "gemini") {
+          raw = await callGeminiVision(shotPrompt, [checked.image], CHECK_RESULT_GEMINI_SCHEMA);
+        } else {
+          if (!client) {
+            return res.status(500).json({ error: "AI service is not configured." });
+          }
+          const response = await client.chat.completions.create({
+            model: visionProvider.model,
+            response_format: { type: "json_schema", json_schema: { name: "check_result", strict: true, schema: CHECK_RESULT_JSON_SCHEMA } },
+            temperature: 0.7,
+            messages: [
+              { role: "system", content: shotPrompt },
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: shotUserText },
+                  { type: "image_url", image_url: { url: checked.image } },
+                ],
+              },
             ],
-          },
-        ],
-      });
-      raw = response?.choices?.[0]?.message?.content;
+          });
+          raw = response?.choices?.[0]?.message?.content;
+        }
+      } catch (error) {
+        if (error && error.status) console.error("Shot provider error status:", error.status, error.message || "");
+        else console.error("Shot error:", error && error.message ? error.message : error);
+        const mapped = mapVisionUpstreamError(error);
+        return res.status(mapped.status).json({ error: mapped.error });
+      }
+      if (!raw) { console.error("Shot empty model response (attempt " + (attempt + 1) + ")"); continue; }
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseError) {
+        console.error("JSON parse error:", parseError.message);
+        continue;
+      }
+      const formatted = formatRizzResult(parsed, shotMode);
+      if (formatted) return res.json(formatted);
+      console.error("Shot result failed schema validation (attempt " + (attempt + 1) + ")");
     }
-    if (!raw) return res.status(500).json({ error: "No result returned." });
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (parseError) {
-      console.error("JSON parse error:", parseError.message);
-      return res.status(500).json({ error: "AI returned invalid JSON." });
-    }
-    return res.json(formatRizzResult(parsed, "shot"));
+    return res.status(500).json({ error: "The check failed — please try again." });
   } catch (error) {
     if (error && error.status) console.error("Shot provider error status:", error.status, error.message || "");
     else console.error("Shot error:", error && error.message ? error.message : error);
