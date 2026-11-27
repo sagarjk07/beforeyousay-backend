@@ -55,6 +55,7 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
    thread handler also checks the decoded image total itself (see
    sanitiseThreadImages) and answers 413 when it is too large. */
 app.use(function (req, res, next) {
+  if (req.path === "/check-shot") return express.json({ limit: "10mb" })(req, res, next);
   if (req.path === "/analyze-thread") return express.json({ limit: "10mb" })(req, res, next);
   if (req.path === "/vault/upload" || req.path === "/hr-audit") return express.json({ limit: "14mb" })(req, res, next);
   return express.json({ limit: "1mb" })(req, res, next);
@@ -67,6 +68,8 @@ app.use(function (err, req, res, next) {
   if (err && (err.type === "entity.too.large" || err.status === 413)) {
     const msg = req.path === "/analyze-thread"
       ? "That upload is too large — try fewer or smaller screenshots."
+      : req.path === "/check-shot"
+      ? "That screenshot is too large — try a smaller one (max 2MB)."
       : (req.path === "/vault/upload" || req.path === "/hr-audit")
       ? "That file is too large — 10MB max per document."
       : "That message is too large. Please keep it under 1000 characters.";
@@ -1302,14 +1305,18 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
   }
 });
 
-/* ---------- Pivot 3: POST /rizz — Rizz Check ----------
+/* ---------- Pivot 3: POST /rizz — Rizz Check (Evolve 2027: five text-check modes) ----------
    Same guards as /analyze: validate input, signed-in daily limit
-   (a rizz check counts as one check), guest 5/hour, Turnstile, then
+   (a check counts as one check), guest 5/hour, Turnstile, then
    the AI (MOCK_AI -> OpenAI gpt-5.4-nano, the same text model
    /analyze uses). No cache for rizz results. The response is the
    strict rizz shape, normalised by formatRizzResult: score, label,
-   roast, signal, replies[2] (one smooth, one funny). Roasts stay
-   light and funny, never cruel and never sexualised. */
+   roast, signal, tip, mode, replies[3] (smooth, funny, chill).
+   Roasts stay light and funny, never cruel and never sexualised.
+   Never help the user deceive, harass, manipulate, or cheat
+   anyone; an apology must be genuine, with no blame-shifting.
+   Modes are CONFIG, not rebuilds: adding a future trend is a new
+   entry in RIZZ_MODE_DEFS, not a new endpoint. */
 const RIZZ_MAX_CHARS = 500;
 const RIZZ_LABELS = [
   { max: 20, label: "Dry texter" },
@@ -1318,33 +1325,155 @@ const RIZZ_LABELS = [
   { max: 80, label: "Smooth" },
   { max: 100, label: "Certified smooth" },
 ];
+/* Evolve 2027: one entry per text-check mode. The band labels are
+   the only thing that differs per mode besides the prompt task —
+   the response shape, the guards and the limits are identical. */
+const RIZZ_MODE_DEFS = {
+  reply: {
+    label: "What do I say back?",
+    task: "Read THEIR last message and judge how interested they seem",
+    inputRole: "the message the user received and needs to reply to",
+    roastRole: "one line reading what their message means — what they are really saying",
+    signalRole: "one line on what the other person is signalling (interest, boredom, testing the waters)",
+    replyRoles: ["a smooth reply to their message", "a funny reply to their message", "a chill, low-effort reply to their message"],
+    scoreGuide: "score how interested THEY seem: 0-20 = barely interested, 61-100 = clearly into it and inviting a reply.",
+    bands: [
+      { max: 20, label: "Not feeling it" },
+      { max: 40, label: "Lukewarm" },
+      { max: 60, label: "Curious" },
+      { max: 80, label: "Into it" },
+      { max: 100, label: "Very into it" },
+    ],
+    tipFallback: "Match their energy, then add one question — it keeps the conversation moving without chasing.",
+  },
+  opener: {
+    label: "First text",
+    task: "Rate this first message / opener",
+    inputRole: "the opener the user is about to send to someone new",
+    roastRole: "one playful roast of the opener, 1-2 lines",
+    signalRole: "one line on what the opener signals about the sender",
+    replyRoles: ["a stronger version of the same opener", "a funnier version of the same opener", "a chiller, more natural version of the same opener"],
+    scoreGuide: "a generic \"hey\" or \"what's up\" is 0-20; a specific, confident opener that shows you noticed something real about them is 61-100.",
+    bands: [
+      { max: 20, label: "Falls flat" },
+      { max: 40, label: "Needs work" },
+      { max: 60, label: "Decent start" },
+      { max: 80, label: "Strong opener" },
+      { max: 100, label: "Instant reply bait" },
+    ],
+    tipFallback: "Open with something specific to them, not a generic greeting — it is much harder to ignore.",
+  },
+  apology: {
+    label: "Sorry text",
+    task: "Rate this apology for how sincere it lands",
+    inputRole: "the apology the user is about to send",
+    roastRole: "one gentle, honest line on where the apology falls short, if anywhere",
+    signalRole: "one line on what the apology signals about whether the user means it",
+    replyRoles: ["a more genuine version of the same apology", "a shorter, cleaner version of the same apology", "a warmer version of the same apology"],
+    scoreGuide: "a real apology owns the mistake with no excuses and no blame-shifting, 61-100; an apology with a \"but\", an excuse, or a guilt trip is 0-40.",
+    bands: [
+      { max: 20, label: "Sounds hollow" },
+      { max: 40, label: "Needs work" },
+      { max: 60, label: "Getting there" },
+      { max: 80, label: "Genuinely sorry" },
+      { max: 100, label: "Heartfelt" },
+    ],
+    tipFallback: "Say what you did, say you are sorry, and stop there — no \"but\", no excuses, no asking them to comfort you.",
+  },
+  dry: {
+    label: "Left on read?",
+    task: "Rate how dry the user's last message reads — a high score means very dry",
+    inputRole: "the user's last message that got left on read, or the dying conversation",
+    roastRole: "one playful roast of how dry the message reads, 1-2 lines",
+    signalRole: "one line on why the conversation is dying",
+    replyRoles: ["a smooth rescue reply that restarts the conversation", "a funny rescue reply that restarts the conversation", "a chill, low-pressure rescue reply"],
+    scoreGuide: "score how dry the message reads: 0-20 = still alive and replyable, 61-100 = bone dry, no hook, nothing to answer.",
+    bands: [
+      { max: 20, label: "Still alive" },
+      { max: 40, label: "A bit dry" },
+      { max: 60, label: "Drying out" },
+      { max: 80, label: "Pretty dry" },
+      { max: 100, label: "Bone dry" },
+    ],
+    tipFallback: "When a chat dies, change the subject with something new — a question, a photo, a plan — instead of repeating the same dead thread.",
+  },
+};
+const STYLE_SAMPLE_MAX_CHARS = 280;
+function modeLabelForScore(mode, score) {
+  if (mode === "rizz") return rizzLabelForScore(score);
+  const bands = mode === "shot" ? SHOT_BANDS : (RIZZ_MODE_DEFS[mode] ? RIZZ_MODE_DEFS[mode].bands : RIZZ_LABELS);
+  const s = Math.min(100, Math.max(0, Math.round(Number(score) || 0)));
+  for (let i = 0; i < bands.length; i++) if (s <= bands[i].max) return bands[i].label;
+  return bands[bands.length - 1].label;
+}
 function rizzLabelForScore(score) {
   const s = Math.min(100, Math.max(0, Math.round(Number(score) || 0)));
   for (let i = 0; i < RIZZ_LABELS.length; i++) if (s <= RIZZ_LABELS[i].max) return RIZZ_LABELS[i].label;
   return "Certified smooth";
 }
-function buildRizzPrompt(text) {
+function sanitiseStyleSample(value) {
+  if (value === undefined || value === null || value === "") return { value: "" };
+  if (typeof value !== "string") return { error: "Style sample must be text." };
+  const v = value.trim();
+  if (v.length > STYLE_SAMPLE_MAX_CHARS) return { error: "Keep your style sample under 280 characters." };
+  return { value: v };
+}
+function buildRizzPrompt(text, styleSample) {
+  const styleLine = styleSample ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
   return `You are BeforeYouSay Rizz Check — a playful Gen Z wingman that rates a DM or text before it gets sent.
 Rate this message for rizz (charm, flirt game, smoothness):
 ---
 ${text}
----
+---${styleLine}
 Return valid JSON only in this exact structure:
 {
   "score": 0-100,
   "label": "Dry texter | Needs work | Mid but trying | Smooth | Certified smooth",
   "roast": "string — one playful roast of the message, 1-2 lines",
   "signal": "string — one line on what the message actually signals to the other person",
+  "tip": "string — one line: what the user should do differently next time",
   "replies": [
     { "style": "smooth", "text": "string — a smoother version of the same message, sendable as written" },
-    { "style": "funny", "text": "string — a funnier version of the same message, sendable as written" }
+    { "style": "funny", "text": "string — a funnier version of the same message, sendable as written" },
+    { "style": "chill", "text": "string — a chiller, more laid-back version of the same message, sendable as written" }
   ]
 }
 Rules:
 - Score honestly: a dry "hey" or one-word reply is 0-20; a confident, specific, playful opener with a question or a hook is 61-100.
 - The roast is light and funny, never cruel. Never mock someone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
+- Never help the user deceive, harass, manipulate, or cheat anyone.
 - Both replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
-- Keep the roast and the signal short — this is a quick check, not an essay.`;
+- Keep the roast, the signal and the tip short — this is a quick check, not an essay.`;
+}
+function buildModePrompt(mode, text, styleSample) {
+  if (mode === "rizz" || !RIZZ_MODE_DEFS[mode]) return buildRizzPrompt(text, styleSample);
+  const def = RIZZ_MODE_DEFS[mode];
+  const styleLine = styleSample ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+  const labels = def.bands.map(function (b) { return b.label; }).join(" | ");
+  return `You are BeforeYouSay — a playful Gen Z texting coach that helps people sound like themselves, only better.
+${def.task}:
+---
+${text}
+---${styleLine}
+Return valid JSON only in this exact structure:
+{
+  "score": 0-100,
+  "label": "${labels}",
+  "roast": "string — ${def.roastRole}",
+  "signal": "string — ${def.signalRole}",
+  "tip": "string — one line: what the user should do differently next time",
+  "replies": [
+    { "style": "smooth", "text": "string — ${def.replyRoles[0]}, sendable as written" },
+    { "style": "funny", "text": "string — ${def.replyRoles[1]}, sendable as written" },
+    { "style": "chill", "text": "string — ${def.replyRoles[2]}, sendable as written" }
+  ]
+}
+Rules:
+- Score honestly: ${def.scoreGuide}
+- The roast is light and funny, never cruel. Never mock someone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
+- Never help the user deceive, harass, manipulate, or cheat anyone. An apology must be genuine: own the mistake, no blame-shifting, no excuses, no guilt-tripping the other person.
+- All three replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
+- Keep the roast, the signal and the tip short — this is a quick check, not an essay.`;
 }
 function buildMockRizzResult() {
   /* MOCK_AI canned sample — schema-valid, clearly a sample. */
@@ -1353,27 +1482,103 @@ function buildMockRizzResult() {
     label: "Smooth",
     roast: "Confident opener, zero follow-through — you peaked at 'hey' and then ran out of ideas.",
     signal: "Friendly and low-pressure, but it reads like a group chat message, not a DM.",
+    tip: "Next time, add one specific detail or a question — it gives the other person something to reply to.",
+    mode: "rizz",
     replies: [
       { style: "smooth", text: "Hey — your playlist post caught my eye. What are you listening to right now?" },
       { style: "funny", text: "Okay be honest, how many drafts did 'hey' take you? Asking for a friend (it's me, I'm the friend)." },
+      { style: "chill", text: "hey, your playlist post popped up on my feed — what have you been listening to lately?" },
     ],
   };
 }
-function formatRizzResult(data) {
+function buildMockModeResult(mode) {
+  /* MOCK_AI canned sample per mode — schema-valid, clearly a sample. */
+  switch (mode) {
+    case "reply":
+      return {
+        score: 68, label: "Into it",
+        roast: "They asked you a question back — that is not an accident, that is interest.",
+        signal: "They are keeping the conversation going on purpose, not just being polite.",
+        tip: "Answer what they asked, then ask one thing back — it keeps the ball rolling.",
+        mode: "reply",
+        replies: [
+          { style: "smooth", text: "Haha fair — what about you, what are you up to tonight?" },
+          { style: "funny", text: "Okay, you asking me a question back? Bold. I like it — what are you doing this weekend?" },
+          { style: "chill", text: "haha yeah, what are you up to?" },
+        ],
+      };
+    case "opener":
+      return {
+        score: 64, label: "Strong opener",
+        roast: "Specific, confident, and it actually gives them something to answer — rare for a first text.",
+        signal: "It reads like you noticed something real about them, not a copy-paste opener.",
+        tip: "Keep the next one just as specific — generic is where openers go to die.",
+        mode: "opener",
+        replies: [
+          { style: "smooth", text: "Hey — your post about the playlist caught my eye. What are you listening to right now?" },
+          { style: "funny", text: "Okay, full disclosure: I rewrote this opener four times. How's your week going?" },
+          { style: "chill", text: "hey, loved your post — what have you been up to lately?" },
+        ],
+      };
+    case "apology":
+      return {
+        score: 74, label: "Genuinely sorry",
+        roast: "You owned it, no excuses, no \"but\" — that is how an apology is supposed to sound.",
+        signal: "It reads sincere, not like you are trying to get yourself off the hook.",
+        tip: "Send it once, then give them space — repeating the apology makes it about you.",
+        mode: "apology",
+        replies: [
+          { style: "smooth", text: "I'm really sorry about yesterday — I was out of line, and I get why it upset you." },
+          { style: "funny", text: "Okay, I owe you a proper sorry — yesterday was my bad, no excuses. Can I make it up to you?" },
+          { style: "chill", text: "hey, I'm sorry about yesterday. I get it, and I'll do better." },
+        ],
+      };
+    case "dry":
+      return {
+        score: 78, label: "Pretty dry",
+        roast: "One word, no question, no hook — you basically sent a conversation stop sign.",
+        signal: "It reads like you ran out of things to say, so they did too.",
+        tip: "Next time, end with a question or a plan — give them a reason to reply.",
+        mode: "dry",
+        replies: [
+          { style: "smooth", text: "Okay, that came out drier than I meant — what are you up to this weekend?" },
+          { style: "funny", text: "I just reread my last text and honestly, I would have left me on read too. How's your day going?" },
+          { style: "chill", text: "haha sorry, that was dry — what are you up to?" },
+        ],
+      };
+    default:
+      return buildMockRizzResult();
+  }
+}
+function formatRizzResult(data, mode) {
   /* Normalise any provider answer into the strict rizz shape. The
-     label is always recomputed from the score, so it can never
-     disagree with it. A missing or invalid piece falls back to a
-     safe neutral value, never a crash. */
+     label is always recomputed from the score and the mode, so it can
+     never disagree with either. A missing or invalid piece falls back
+     to a safe neutral value, never a crash. Mode defaults to "rizz"
+     when it is missing or unknown — the old call shape still works.
+     The band/tip lookups below are written as short-circuit
+     ternaries on purpose: a default-mode call only ever reads
+     RIZZ_LABELS, so the function also works standalone (the Pivot 3
+     logic test extracts it without the mode tables). */
+  const m = typeof mode === "string" && mode !== "rizz" && mode !== "shot" ? (RIZZ_MODE_DEFS[mode] ? mode : "rizz") : (mode === "shot" ? "shot" : "rizz");
   const score = Math.min(100, Math.max(0, Math.round(Number(data && data.score) || 0)));
+  const bands = m === "shot" ? SHOT_BANDS : (m === "rizz" ? RIZZ_LABELS : RIZZ_MODE_DEFS[m].bands);
+  let label = bands[bands.length - 1].label;
+  for (let i = 0; i < bands.length; i++) if (score <= bands[i].max) { label = bands[i].label; break; }
   const roast = typeof data?.roast === "string" && data.roast.trim()
     ? data.roast.trim().slice(0, 280)
     : "No strong read on this one — it's giving neutral energy.";
   const signal = typeof data?.signal === "string" && data.signal.trim()
     ? data.signal.trim().slice(0, 280)
     : "It reads friendly, but it doesn't give the other person much to reply to.";
+  const tipFallback = m === "shot" ? SHOT_TIP_FALLBACK : (m === "rizz" ? "Next time, add one specific detail or a question — it gives the other person something to reply to." : RIZZ_MODE_DEFS[m].tipFallback);
+  const tip = typeof data?.tip === "string" && data.tip.trim()
+    ? data.tip.trim().slice(0, 280)
+    : tipFallback;
   const FALLBACK_REPLIES = {
     smooth: "Hey — saw your post and it made me smile. What are you up to this weekend?",
     funny: "Okay, I admit it, I stared at this text for five minutes before sending it. How's your day going?",
+    chill: "hey, saw your post — what have you been up to lately?",
   };
   const given = Array.isArray(data && data.replies) ? data.replies : [];
   function pickReply(style, index) {
@@ -1384,12 +1589,15 @@ function formatRizzResult(data) {
   }
   return {
     score: score,
-    label: rizzLabelForScore(score),
+    label: label,
     roast: roast,
     signal: signal,
+    tip: tip,
+    mode: m,
     replies: [
       { style: "smooth", text: pickReply("smooth", 0) },
       { style: "funny", text: pickReply("funny", 1) },
+      { style: "chill", text: pickReply("chill", 2) },
     ],
   };
 }
@@ -1403,6 +1611,12 @@ app.post("/rizz", analyzeLimiter, async (req, res) => {
     if (text.length > RIZZ_MAX_CHARS) {
       return res.status(400).json({ error: "Keep it under 500 characters — paste the message, not the whole chat." });
     }
+    const mode = typeof body.mode === "string" && body.mode.trim() ? body.mode.trim() : "rizz";
+    if (mode !== "rizz" && !RIZZ_MODE_DEFS[mode]) {
+      return res.status(400).json({ error: "Pick a valid check mode." });
+    }
+    const styleSample = sanitiseStyleSample(body.styleSample);
+    if (styleSample.error) return res.status(400).json({ error: styleSample.error });
     const limitCheck = await checkSignedInDailyLimit(req);
     if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
     if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
@@ -1410,7 +1624,7 @@ app.post("/rizz", analyzeLimiter, async (req, res) => {
     }
     const turnstile = await verifyTurnstile(req);
     if (turnstile) return res.status(turnstile.status).json({ error: turnstile.error });
-    if (process.env.MOCK_AI === "true") return res.json(formatRizzResult(buildMockRizzResult()));
+    if (process.env.MOCK_AI === "true") return res.json(formatRizzResult(buildMockModeResult(mode), mode));
     if (!client) return res.status(500).json({ error: "AI service is not configured." });
     let raw;
     try {
@@ -1419,7 +1633,7 @@ app.post("/rizz", analyzeLimiter, async (req, res) => {
         response_format: { type: "json_object" },
         temperature: 0.8,
         messages: [
-          { role: "system", content: buildRizzPrompt(text) },
+          { role: "system", content: buildModePrompt(mode, text, styleSample.value) },
           { role: "user", content: "Rate this DM:\n\n" + text },
         ],
       });
@@ -1438,10 +1652,144 @@ app.post("/rizz", analyzeLimiter, async (req, res) => {
       console.error("JSON parse error:", parseError.message);
       return res.status(500).json({ error: "AI returned invalid JSON." });
     }
-    return res.json(formatRizzResult(parsed));
+    return res.json(formatRizzResult(parsed, mode));
   } catch (error) {
     if (error && error.status) console.error("Rizz provider error status:", error.status, error.message || "");
     else console.error("Rizz error:", error && error.message ? error.message : error);
+    const mapped = mapVisionUpstreamError(error);
+    return res.status(mapped.status).json({ error: mapped.error });
+  }
+});
+
+/* ---------- Evolve 2027: POST /check-shot — Screenshot check ----------
+   One screenshot of a conversation, read once and dropped — never
+   stored, never logged. Same guards as /rizz, in the same order:
+   validate, signed-in daily limit (a screenshot counts as one
+   check), guest 5/hour, Turnstile, then the vision provider
+   (MOCK_AI -> Gemini gemini-3.8-flash -> OpenAI gpt-4.1-mini, the
+   same provider order /analyze-thread uses). The response is the
+   same shape as /rizz, with mode "shot" and a vibe score. */
+const SHOT_MAX_IMAGE_BYTES = 2 * 1024 * 1024; /* decoded bytes — one screenshot, max 2MB */
+const SHOT_MIMES = ["image/jpeg", "image/png", "image/webp"];
+const SHOT_BANDS = [
+  { max: 20, label: "Cold" },
+  { max: 40, label: "Lukewarm" },
+  { max: 60, label: "Warm" },
+  { max: 80, label: "Hot" },
+  { max: 100, label: "On fire" },
+];
+const SHOT_TIP_FALLBACK = "Reply to the last thing they actually said, not to the whole conversation — it feels more natural.";
+function sanitiseShotImage(image, mimeType) {
+  if (!image || typeof image !== "string") return { error: "Add a screenshot to check.", status: 400 };
+  let mime = mimeType;
+  let b64 = image;
+  const m = image.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+  if (m) { mime = "image/" + m[1]; b64 = m[2]; }
+  if (!mime || SHOT_MIMES.indexOf(mime) === -1) return { error: "That screenshot must be a JPEG, PNG or WebP image.", status: 400 };
+  if (!/^[A-Za-z0-9+/=]+$/.test(b64)) return { error: "That screenshot must be a JPEG, PNG or WebP image.", status: 400 };
+  const decodedBytes = Math.floor(b64.length * 3 / 4);
+  if (decodedBytes > SHOT_MAX_IMAGE_BYTES) return { error: "That screenshot is too large — try a smaller one (max 2MB).", status: 413 };
+  return { image: "data:" + mime + ";base64," + b64, mime: mime };
+}
+function buildShotPrompt(styleSample) {
+  const styleLine = styleSample ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+  return `You are BeforeYouSay — a playful Gen Z texting coach that helps people sound like themselves, only better.
+Read this conversation screenshot and judge the vibe — who is interested, who is pulling away, and what the user should send back.
+${styleLine}
+Return valid JSON only in this exact structure:
+{
+  "score": 0-100,
+  "label": "Cold | Lukewarm | Warm | Hot | On fire",
+  "roast": "string — one line reading what is actually happening in the conversation",
+  "signal": "string — one line on what the other person is signalling",
+  "tip": "string — one line: what the user should do differently next time",
+  "replies": [
+    { "style": "smooth", "text": "string — a smooth reply the user can send next, sendable as written" },
+    { "style": "funny", "text": "string — a funny reply the user can send next, sendable as written" },
+    { "style": "chill", "text": "string — a chill, low-pressure reply the user can send next, sendable as written" }
+  ]
+}
+Rules:
+- Score the vibe honestly: 0-20 = cold or uninterested, 61-100 = warm, engaged, and going somewhere.
+- The read is light and funny, never cruel. Never mock anyone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
+- Never help the user deceive, harass, manipulate, or cheat anyone.
+- All three replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
+- Keep the read, the signal and the tip short — this is a quick check, not an essay.`;
+}
+function buildMockShotResult() {
+  /* MOCK_AI canned sample — schema-valid, clearly a sample. */
+  return {
+    score: 58,
+    label: "Warm",
+    roast: "They are asking questions back — that is not politeness, that is interest.",
+    signal: "The conversation has momentum; they are matching your energy.",
+    tip: "Reply to the last thing they said, then ask one question back.",
+    mode: "shot",
+    replies: [
+      { style: "smooth", text: "Haha fair enough — what are you up to tonight?" },
+      { style: "funny", text: "Okay, you asking me questions back? I see you. What are you doing this weekend?" },
+      { style: "chill", text: "haha nice, what are you up to?" },
+    ],
+  };
+}
+app.use("/check-shot", optionalAuth);
+app.use("/check-shot", limiter);
+app.post("/check-shot", analyzeLimiter, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const checked = sanitiseShotImage(body.image, body.mimeType);
+    if (checked.error) return res.status(checked.status).json({ error: checked.error });
+    const styleSample = sanitiseStyleSample(body.styleSample);
+    if (styleSample.error) return res.status(400).json({ error: styleSample.error });
+    const limitCheck = await checkSignedInDailyLimit(req);
+    if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
+    if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
+      return res.status(429).json({ error: GUEST_HOURLY_LIMIT_MESSAGE });
+    }
+    const turnstile = await verifyTurnstile(req);
+    if (turnstile) return res.status(turnstile.status).json({ error: turnstile.error });
+    if (process.env.MOCK_AI === "true") return res.json(formatRizzResult(buildMockShotResult(), "shot"));
+    const visionProvider = selectVisionProvider();
+    if (visionProvider.provider === "none") {
+      return res.status(500).json({ error: "AI service is not configured." });
+    }
+    const shotPrompt = buildShotPrompt(styleSample.value);
+    let raw = null;
+    if (visionProvider.provider === "gemini") {
+      raw = await callGeminiVision(shotPrompt, [checked.image]);
+    } else {
+      if (!client) {
+        return res.status(500).json({ error: "AI service is not configured." });
+      }
+      const response = await client.chat.completions.create({
+        model: visionProvider.model,
+        response_format: { type: "json_object" },
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: shotPrompt },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Read this conversation screenshot and tell me what is happening and what I should send back." },
+              { type: "image_url", image_url: { url: checked.image } },
+            ],
+          },
+        ],
+      });
+      raw = response?.choices?.[0]?.message?.content;
+    }
+    if (!raw) return res.status(500).json({ error: "No result returned." });
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseError) {
+      console.error("JSON parse error:", parseError.message);
+      return res.status(500).json({ error: "AI returned invalid JSON." });
+    }
+    return res.json(formatRizzResult(parsed, "shot"));
+  } catch (error) {
+    if (error && error.status) console.error("Shot provider error status:", error.status, error.message || "");
+    else console.error("Shot error:", error && error.message ? error.message : error);
     const mapped = mapVisionUpstreamError(error);
     return res.status(mapped.status).json({ error: mapped.error });
   }
