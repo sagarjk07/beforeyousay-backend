@@ -1302,6 +1302,151 @@ app.post("/analyze", analyzeLimiter, async (req, res) => {
   }
 });
 
+/* ---------- Pivot 3: POST /rizz — Rizz Check ----------
+   Same guards as /analyze: validate input, signed-in daily limit
+   (a rizz check counts as one check), guest 5/hour, Turnstile, then
+   the AI (MOCK_AI -> OpenAI gpt-5.4-nano, the same text model
+   /analyze uses). No cache for rizz results. The response is the
+   strict rizz shape, normalised by formatRizzResult: score, label,
+   roast, signal, replies[2] (one smooth, one funny). Roasts stay
+   light and funny, never cruel and never sexualised. */
+const RIZZ_MAX_CHARS = 500;
+const RIZZ_LABELS = [
+  { max: 20, label: "Dry texter" },
+  { max: 40, label: "Needs work" },
+  { max: 60, label: "Mid but trying" },
+  { max: 80, label: "Smooth" },
+  { max: 100, label: "Certified smooth" },
+];
+function rizzLabelForScore(score) {
+  const s = Math.min(100, Math.max(0, Math.round(Number(score) || 0)));
+  for (let i = 0; i < RIZZ_LABELS.length; i++) if (s <= RIZZ_LABELS[i].max) return RIZZ_LABELS[i].label;
+  return "Certified smooth";
+}
+function buildRizzPrompt(text) {
+  return `You are BeforeYouSay Rizz Check — a playful Gen Z wingman that rates a DM or text before it gets sent.
+Rate this message for rizz (charm, flirt game, smoothness):
+---
+${text}
+---
+Return valid JSON only in this exact structure:
+{
+  "score": 0-100,
+  "label": "Dry texter | Needs work | Mid but trying | Smooth | Certified smooth",
+  "roast": "string — one playful roast of the message, 1-2 lines",
+  "signal": "string — one line on what the message actually signals to the other person",
+  "replies": [
+    { "style": "smooth", "text": "string — a smoother version of the same message, sendable as written" },
+    { "style": "funny", "text": "string — a funnier version of the same message, sendable as written" }
+  ]
+}
+Rules:
+- Score honestly: a dry "hey" or one-word reply is 0-20; a confident, specific, playful opener with a question or a hook is 61-100.
+- The roast is light and funny, never cruel. Never mock someone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
+- Both replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
+- Keep the roast and the signal short — this is a quick check, not an essay.`;
+}
+function buildMockRizzResult() {
+  /* MOCK_AI canned sample — schema-valid, clearly a sample. */
+  return {
+    score: 72,
+    label: "Smooth",
+    roast: "Confident opener, zero follow-through — you peaked at 'hey' and then ran out of ideas.",
+    signal: "Friendly and low-pressure, but it reads like a group chat message, not a DM.",
+    replies: [
+      { style: "smooth", text: "Hey — your playlist post caught my eye. What are you listening to right now?" },
+      { style: "funny", text: "Okay be honest, how many drafts did 'hey' take you? Asking for a friend (it's me, I'm the friend)." },
+    ],
+  };
+}
+function formatRizzResult(data) {
+  /* Normalise any provider answer into the strict rizz shape. The
+     label is always recomputed from the score, so it can never
+     disagree with it. A missing or invalid piece falls back to a
+     safe neutral value, never a crash. */
+  const score = Math.min(100, Math.max(0, Math.round(Number(data && data.score) || 0)));
+  const roast = typeof data?.roast === "string" && data.roast.trim()
+    ? data.roast.trim().slice(0, 280)
+    : "No strong read on this one — it's giving neutral energy.";
+  const signal = typeof data?.signal === "string" && data.signal.trim()
+    ? data.signal.trim().slice(0, 280)
+    : "It reads friendly, but it doesn't give the other person much to reply to.";
+  const FALLBACK_REPLIES = {
+    smooth: "Hey — saw your post and it made me smile. What are you up to this weekend?",
+    funny: "Okay, I admit it, I stared at this text for five minutes before sending it. How's your day going?",
+  };
+  const given = Array.isArray(data && data.replies) ? data.replies : [];
+  function pickReply(style, index) {
+    const byStyle = given.find(function (r) { return r && r.style === style && typeof r.text === "string" && r.text.trim(); });
+    const r = byStyle || given[index];
+    const text = r && typeof r.text === "string" && r.text.trim() ? r.text.trim().slice(0, 280) : "";
+    return text || FALLBACK_REPLIES[style];
+  }
+  return {
+    score: score,
+    label: rizzLabelForScore(score),
+    roast: roast,
+    signal: signal,
+    replies: [
+      { style: "smooth", text: pickReply("smooth", 0) },
+      { style: "funny", text: pickReply("funny", 1) },
+    ],
+  };
+}
+app.use("/rizz", optionalAuth);
+app.use("/rizz", limiter);
+app.post("/rizz", analyzeLimiter, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const text = typeof body.text === "string" ? body.text.trim() : "";
+    if (!text) return res.status(400).json({ error: "Paste a DM or text to check first." });
+    if (text.length > RIZZ_MAX_CHARS) {
+      return res.status(400).json({ error: "Keep it under 500 characters — paste the message, not the whole chat." });
+    }
+    const limitCheck = await checkSignedInDailyLimit(req);
+    if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
+    if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
+      return res.status(429).json({ error: GUEST_HOURLY_LIMIT_MESSAGE });
+    }
+    const turnstile = await verifyTurnstile(req);
+    if (turnstile) return res.status(turnstile.status).json({ error: turnstile.error });
+    if (process.env.MOCK_AI === "true") return res.json(formatRizzResult(buildMockRizzResult()));
+    if (!client) return res.status(500).json({ error: "AI service is not configured." });
+    let raw;
+    try {
+      const response = await client.chat.completions.create({
+        model: OPENAI_TEXT_MODEL,
+        response_format: { type: "json_object" },
+        temperature: 0.8,
+        messages: [
+          { role: "system", content: buildRizzPrompt(text) },
+          { role: "user", content: "Rate this DM:\n\n" + text },
+        ],
+      });
+      raw = response && response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content : null;
+    } catch (error) {
+      if (error && error.status) console.error("Rizz provider error status:", error.status, error.message || "");
+      else console.error("Rizz error:", error && error.message ? error.message : error);
+      const mapped = mapVisionUpstreamError(error);
+      return res.status(mapped.status).json({ error: mapped.error });
+    }
+    if (!raw) return res.status(500).json({ error: "No result returned." });
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseError) {
+      console.error("JSON parse error:", parseError.message);
+      return res.status(500).json({ error: "AI returned invalid JSON." });
+    }
+    return res.json(formatRizzResult(parsed));
+  } catch (error) {
+    if (error && error.status) console.error("Rizz provider error status:", error.status, error.message || "");
+    else console.error("Rizz error:", error && error.message ? error.message : error);
+    const mapped = mapVisionUpstreamError(error);
+    return res.status(mapped.status).json({ error: mapped.error });
+  }
+});
+
 /* ---------- Sprint 2: POST /analyze-thread ----------
    Same guards as /analyze: lane whitelist, signed-in daily limit (a
    thread counts as one check), Turnstile, 60s vision timeout, safe
