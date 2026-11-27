@@ -1397,8 +1397,96 @@ const RIZZ_MODE_DEFS = {
     ],
     tipFallback: "When a chat dies, change the subject with something new — a question, a photo, a plan — instead of repeating the same dead thread.",
   },
+  calm: {
+    label: "Calm it down",
+    task: "Rewrite this angry or anxious rant as a calm, clear message the user can actually send",
+    inputRole: "the angry or anxious rant the user typed",
+    roastRole: "one honest line on how heated the draft reads",
+    signalRole: "one line on how the draft would land on the other person if sent as written",
+    replyRoles: ["a calm, clear version of the same message", "a shorter, cooler version of the same message", "a warm but firm version of the same message"],
+    scoreGuide: "score how heated the draft reads: 0-20 = already calm, 61-100 = furious, about to send something they will regret.",
+    bands: [
+      { max: 20, label: "Already calm" },
+      { max: 40, label: "A bit heated" },
+      { max: 60, label: "Pretty heated" },
+      { max: 80, label: "Very heated" },
+      { max: 100, label: "About to blow up" },
+    ],
+    tipFallback: "Write the angry version, wait ten minutes, then send the calm one.",
+  },
+  work: {
+    label: "Work / Boss",
+    task: "Rate this work message for how professional it lands",
+    inputRole: "the work message the user is about to send",
+    roastRole: "one honest line on where the work message goes wrong, if anywhere",
+    signalRole: "one line on how the message would read to a boss or colleague",
+    replyRoles: ["a more professional version of the same message", "a shorter, clearer version of the same message", "a warmer version of the same message"],
+    scoreGuide: "a short, specific work message with one clear ask is 61-100; a long, emotional or vague message is 0-40.",
+    bands: [
+      { max: 20, label: "Too casual" },
+      { max: 40, label: "Needs polish" },
+      { max: 60, label: "Decent" },
+      { max: 80, label: "Professional" },
+      { max: 100, label: "Flawless" },
+    ],
+    tipFallback: "Keep work messages short, specific, and free of emotion — one ask per message.",
+  },
+  boundary: {
+    label: "Say no",
+    task: "Rate how clearly and firmly this message sets a boundary or says no",
+    inputRole: "the draft message where the user needs to refuse or set a limit",
+    roastRole: "one honest line on where the no goes soft, if anywhere",
+    signalRole: "one line on how firm and clear the boundary reads",
+    replyRoles: ["a clearer, firmer version of the same no", "a shorter version of the same no", "a kinder version of the same no"],
+    scoreGuide: "a no that is short, clear and gives one reason is 61-100; a no buried in apologies, excuses or maybes is 0-40.",
+    bands: [
+      { max: 20, label: "Too soft" },
+      { max: 40, label: "A bit wobbly" },
+      { max: 60, label: "Getting there" },
+      { max: 80, label: "Clear and firm" },
+      { max: 100, label: "Rock solid" },
+    ],
+    tipFallback: "A good no is short: say no, give one reason, stop there.",
+  },
+  deescalate: {
+    label: "De-escalate a fight",
+    task: "Rate how likely this message is to calm a fight down",
+    inputRole: "the heated message the user is about to send during a fight",
+    roastRole: "one honest line on how the message would pour fuel on the fight, if it would",
+    signalRole: "one line on how the message would land on someone who is already upset",
+    replyRoles: ["a calmer version of the same message", "a shorter version that lowers the temperature", "a warmer version that opens a door"],
+    scoreGuide: "a message that acknowledges their feelings first and stays calm is 61-100; a message that blames, mocks or escalates is 0-40.",
+    bands: [
+      { max: 20, label: "Will make it worse" },
+      { max: 40, label: "Not helping" },
+      { max: 60, label: "Neutral" },
+      { max: 80, label: "Calming" },
+      { max: 100, label: "Peace-maker" },
+    ],
+    tipFallback: "Acknowledge how they feel first — people cannot hear your point until they feel heard.",
+  },
+  practice: {
+    label: "Daily Dilemma",
+    task: "Rate this practice reply to today's dilemma",
+    inputRole: "the practice reply the user wrote for today's dilemma",
+    roastRole: "one line on what the practice reply gets right or wrong",
+    signalRole: "one line on how the reply would land on the other person",
+    replyRoles: ["a stronger version of the practice reply", "a funnier version of the practice reply", "a chiller version of the practice reply"],
+    scoreGuide: "a reply that is specific, calm and gives the other person something to answer is 61-100; a generic, defensive or rambling reply is 0-40.",
+    bands: [
+      { max: 20, label: "Needs work" },
+      { max: 40, label: "Getting there" },
+      { max: 60, label: "Decent" },
+      { max: 80, label: "Strong reply" },
+      { max: 100, label: "Nailed it" },
+    ],
+    tipFallback: "Practice again tomorrow — small daily reps are how texting gets easier.",
+  },
 };
 const STYLE_SAMPLE_MAX_CHARS = 280;
+const PERSON_CONTEXT_MAX_CHARS = 500;
+const STYLE_EXAMPLES_MAX_CHARS = 500;
+const RIZZ_CONTEXT_MAX_CHARS = 280; /* GC-EVOLUTION */
 function modeLabelForScore(mode, score) {
   if (mode === "rizz") return rizzLabelForScore(score);
   const bands = mode === "shot" ? SHOT_BANDS : (RIZZ_MODE_DEFS[mode] ? RIZZ_MODE_DEFS[mode].bands : RIZZ_LABELS);
@@ -1418,13 +1506,38 @@ function sanitiseStyleSample(value) {
   if (v.length > STYLE_SAMPLE_MAX_CHARS) return { error: "Keep your style sample under 280 characters." };
   return { value: v };
 }
-function buildRizzPrompt(text, styleSample) {
-  const styleLine = styleSample ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+function sanitisePersonContext(value) {
+  if (value === undefined || value === null || value === "") return { value: "" };
+  if (typeof value !== "string") return { error: "Person details must be text." };
+  const v = value.trim();
+  if (v.length > PERSON_CONTEXT_MAX_CHARS) return { error: "Keep the person details under 500 characters." };
+  return { value: v };
+}
+function sanitiseStyleExamples(value) {
+  if (value === undefined || value === null || value === "") return { value: "" };
+  if (typeof value !== "string") return { error: "Style examples must be text." };
+  const v = value.trim();
+  if (v.length > STYLE_EXAMPLES_MAX_CHARS) return { error: "Keep your example texts under 500 characters." };
+  return { value: v };
+}
+function sanitiseRizzContext(value) {
+  if (value === undefined || value === null || value === "") return { value: "" };
+  if (typeof value !== "string") return { error: "Context must be text." };
+  const v = value.trim();
+  if (v.length > RIZZ_CONTEXT_MAX_CHARS) return { error: "Keep the context under 280 characters." };
+  return { value: v };
+}
+function buildRizzPrompt(text, styleSample, opts) {
+  const o = opts || {};
+  const styleLine = (styleSample && !o.styleExamples) ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+  const personLine = o.personContext ? "\nThis message is for: " + o.personContext + " — write replies that fit that person and what you know about them.\n" : "";
+  const examplesLine = o.styleExamples ? "\nHere are real texts the user actually sent — copy their voice exactly (punctuation, capitalisation, length, slang):\n" + o.styleExamples + "\n" : "";
+  const contextLine = o.context ? "\nContext: " + o.context + "\n" : "";
   return `You are BeforeYouSay Rizz Check — a playful Gen Z wingman that rates a DM or text before it gets sent.
 Rate this message for rizz (charm, flirt game, smoothness):
 ---
 ${text}
----${styleLine}
+---${styleLine}${personLine}${examplesLine}${contextLine}
 Return valid JSON only in this exact structure:
 {
   "score": 0-100,
@@ -1432,6 +1545,9 @@ Return valid JSON only in this exact structure:
   "roast": "string — one playful roast of the message, 1-2 lines",
   "signal": "string — one line on what the message actually signals to the other person",
   "tip": "string — one line: what the user should do differently next time",
+  "verdict": "send | tweak | wait | dont — whether the user should send this message as written",
+  "lands": "string — one line on how the message reads to the recipient",
+  "dontSend": "string — one line naming the specific thing NOT to send or do, or an empty string if there is nothing specific",
   "replies": [
     { "style": "smooth", "text": "string — a smoother version of the same message, sendable as written" },
     { "style": "funny", "text": "string — a funnier version of the same message, sendable as written" },
@@ -1443,18 +1559,25 @@ Rules:
 - The roast is light and funny, never cruel. Never mock someone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
 - Never help the user deceive, harass, manipulate, or cheat anyone.
 - Both replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
+- Write like a real person texting, not a corporate email or a therapy session. No cliches ("at the end of the day", "just checking in", "circle back"), no therapy-speak ("I hear you", "holding space"), no LinkedIn voice, no metaphors, no paragraphs. No exclamation-mark overload — at most one exclamation mark across all three replies, and usually none.
+- The "chill" reply must be under 12 words. All replies stay short, slightly imperfect, and lowercase-friendly — real texting, not a polished speech.
+- Return verdict "dont" when the message should not be sent at all — for example texting someone who told them no, a blocked contact, or a third unanswered message in a row. Say so plainly in "lands" and name the specific thing to avoid in "dontSend".
 - Keep the roast, the signal and the tip short — this is a quick check, not an essay.`;
 }
-function buildModePrompt(mode, text, styleSample) {
-  if (mode === "rizz" || !RIZZ_MODE_DEFS[mode]) return buildRizzPrompt(text, styleSample);
+function buildModePrompt(mode, text, styleSample, opts) {
+  if (mode === "rizz" || !RIZZ_MODE_DEFS[mode]) return buildRizzPrompt(text, styleSample, opts);
   const def = RIZZ_MODE_DEFS[mode];
-  const styleLine = styleSample ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+  const o = opts || {};
+  const styleLine = (styleSample && !o.styleExamples) ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+  const personLine = o.personContext ? "\nThis message is for: " + o.personContext + " — write replies that fit that person and what you know about them.\n" : "";
+  const examplesLine = o.styleExamples ? "\nHere are real texts the user actually sent — copy their voice exactly (punctuation, capitalisation, length, slang):\n" + o.styleExamples + "\n" : "";
+  const contextLine = o.context ? "\nContext: " + o.context + "\n" : "";
   const labels = def.bands.map(function (b) { return b.label; }).join(" | ");
   return `You are BeforeYouSay — a playful Gen Z texting coach that helps people sound like themselves, only better.
 ${def.task}:
 ---
 ${text}
----${styleLine}
+---${styleLine}${personLine}${examplesLine}${contextLine}
 Return valid JSON only in this exact structure:
 {
   "score": 0-100,
@@ -1462,6 +1585,9 @@ Return valid JSON only in this exact structure:
   "roast": "string — ${def.roastRole}",
   "signal": "string — ${def.signalRole}",
   "tip": "string — one line: what the user should do differently next time",
+  "verdict": "send | tweak | wait | dont — whether the user should send this message as written",
+  "lands": "string — one line on how the message reads to the recipient",
+  "dontSend": "string — one line naming the specific thing NOT to send or do, or an empty string if there is nothing specific",
   "replies": [
     { "style": "smooth", "text": "string — ${def.replyRoles[0]}, sendable as written" },
     { "style": "funny", "text": "string — ${def.replyRoles[1]}, sendable as written" },
@@ -1473,6 +1599,9 @@ Rules:
 - The roast is light and funny, never cruel. Never mock someone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
 - Never help the user deceive, harass, manipulate, or cheat anyone. An apology must be genuine: own the mistake, no blame-shifting, no excuses, no guilt-tripping the other person.
 - All three replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
+- Write like a real person texting, not a corporate email or a therapy session. No cliches ("at the end of the day", "just checking in", "circle back"), no therapy-speak ("I hear you", "holding space"), no LinkedIn voice, no metaphors, no paragraphs. No exclamation-mark overload — at most one exclamation mark across all three replies, and usually none.
+- The "chill" reply must be under 12 words. All replies stay short, slightly imperfect, and lowercase-friendly — real texting, not a polished speech.
+- Return verdict "dont" when the message should not be sent at all — for example texting someone who told them no, a blocked contact, or a third unanswered message in a row. Say so plainly in "lands" and name the specific thing to avoid in "dontSend".
 - Keep the roast, the signal and the tip short — this is a quick check, not an essay.`;
 }
 function buildMockRizzResult() {
@@ -1483,6 +1612,9 @@ function buildMockRizzResult() {
     roast: "Confident opener, zero follow-through — you peaked at 'hey' and then ran out of ideas.",
     signal: "Friendly and low-pressure, but it reads like a group chat message, not a DM.",
     tip: "Next time, add one specific detail or a question — it gives the other person something to reply to.",
+    verdict: "send",
+    lands: "Reads confident and specific — like you actually noticed them.",
+    dontSend: "",
     mode: "rizz",
     replies: [
       { style: "smooth", text: "Hey — your playlist post caught my eye. What are you listening to right now?" },
@@ -1500,6 +1632,9 @@ function buildMockModeResult(mode) {
         roast: "They asked you a question back — that is not an accident, that is interest.",
         signal: "They are keeping the conversation going on purpose, not just being polite.",
         tip: "Answer what they asked, then ask one thing back — it keeps the ball rolling.",
+    verdict: "send",
+    lands: "Reads engaged and natural, not try-hard.",
+    dontSend: "",
         mode: "reply",
         replies: [
           { style: "smooth", text: "Haha fair — what about you, what are you up to tonight?" },
@@ -1513,6 +1648,9 @@ function buildMockModeResult(mode) {
         roast: "Specific, confident, and it actually gives them something to answer — rare for a first text.",
         signal: "It reads like you noticed something real about them, not a copy-paste opener.",
         tip: "Keep the next one just as specific — generic is where openers go to die.",
+    verdict: "send",
+    lands: "Reads confident without trying too hard.",
+    dontSend: "",
         mode: "opener",
         replies: [
           { style: "smooth", text: "Hey — your post about the playlist caught my eye. What are you listening to right now?" },
@@ -1526,6 +1664,9 @@ function buildMockModeResult(mode) {
         roast: "You owned it, no excuses, no \"but\" — that is how an apology is supposed to sound.",
         signal: "It reads sincere, not like you are trying to get yourself off the hook.",
         tip: "Send it once, then give them space — repeating the apology makes it about you.",
+    verdict: "send",
+    lands: "Reads sincere — no excuses, no guilt trip.",
+    dontSend: "",
         mode: "apology",
         replies: [
           { style: "smooth", text: "I'm really sorry about yesterday — I was out of line, and I get why it upset you." },
@@ -1539,11 +1680,94 @@ function buildMockModeResult(mode) {
         roast: "One word, no question, no hook — you basically sent a conversation stop sign.",
         signal: "It reads like you ran out of things to say, so they did too.",
         tip: "Next time, end with a question or a plan — give them a reason to reply.",
+    verdict: "dont",
+    lands: "Three unanswered texts in a row — this one reads desperate.",
+    dontSend: "Don't send the double text — you already messaged twice with no reply.",
         mode: "dry",
         replies: [
           { style: "smooth", text: "Okay, that came out drier than I meant — what are you up to this weekend?" },
           { style: "funny", text: "I just reread my last text and honestly, I would have left me on read too. How's your day going?" },
           { style: "chill", text: "haha sorry, that was dry — what are you up to?" },
+        ],
+      };
+    case "calm":
+      return {
+        score: 80, label: "Very heated",
+        roast: "This is a text you would regret by morning — all heat, no point.",
+        signal: "It reads like an attack, so they will get defensive instead of sorry.",
+        tip: "Write the angry version, wait ten minutes, then send the calm one.",
+        verdict: "wait",
+        lands: "Reads furious — send the calm version instead, not this one.",
+        dontSend: "Don't send this while you are still angry.",
+        mode: "calm",
+        replies: [
+          { style: "smooth", text: "Hey, I was pretty upset earlier — can we talk about what happened tonight?" },
+          { style: "funny", text: "Okay, I wrote a much angrier version of this and deleted it. Can we reset and talk?" },
+          { style: "chill", text: "hey, that upset me earlier. can we talk about it later?" },
+        ],
+      };
+    case "work":
+      return {
+        score: 70, label: "Professional",
+        roast: "Short, clear, one ask — your boss can answer this in ten seconds.",
+        signal: "It reads competent and easy to say yes to.",
+        tip: "One ask per message — two asks in one text get half an answer.",
+        verdict: "send",
+        lands: "Reads professional and clear — easy to say yes to.",
+        dontSend: "",
+        mode: "work",
+        replies: [
+          { style: "smooth", text: "Hi — quick one: could you approve the leave request by Friday? Happy to cover the handover." },
+          { style: "funny", text: "Hi! Small favour — could you approve my leave by Friday? I promise the handover notes will be beautiful." },
+          { style: "chill", text: "hey, could you approve my leave by friday? handover notes are ready." },
+        ],
+      };
+    case "boundary":
+      return {
+        score: 72, label: "Clear and firm",
+        roast: "Short, one reason, full stop — that is how a no is supposed to sound.",
+        signal: "It reads firm without sounding rude.",
+        tip: "A good no is short: say no, give one reason, stop there.",
+        verdict: "send",
+        lands: "Reads clear and firm without sounding rude.",
+        dontSend: "",
+        mode: "boundary",
+        replies: [
+          { style: "smooth", text: "Thanks for thinking of me, but I can't take that shift on — I need the weekend off." },
+          { style: "funny", text: "I appreciate the ask, but my weekend is already booked — by me, doing nothing. Next time?" },
+          { style: "chill", text: "sorry, can't do this one — need the weekend off." },
+        ],
+      };
+    case "deescalate":
+      return {
+        score: 69, label: "Calming",
+        roast: "You heard them first and kept it calm — that is the whole trick.",
+        signal: "It reads like you want to fix it, not win it.",
+        tip: "Acknowledge how they feel first — people cannot hear your point until they feel heard.",
+        verdict: "send",
+        lands: "Reads calming — it opens a door instead of slamming one.",
+        dontSend: "",
+        mode: "deescalate",
+        replies: [
+          { style: "smooth", text: "I get why that upset you — you're right, I should have told you sooner. Can we talk?" },
+          { style: "funny", text: "Okay, I hear you — I messed that one up. Truce? Coffee's on me." },
+          { style: "chill", text: "yeah I get it, you're right. can we talk about it?" },
+        ],
+      };
+    case "practice":
+      return {
+        score: 76, label: "Strong reply",
+        roast: "You said the hard thing without making it a fight — that is the whole skill.",
+        signal: "It reads steady, not defensive.",
+        tip: "Practice again tomorrow — small daily reps are how texting gets easier.",
+        verdict: "send",
+        lands: "Reads calm and clear — they can actually hear you.",
+        dontSend: "",
+        mode: "practice",
+        replies: [
+          { style: "smooth", text: "Okay — let's talk. What's on your mind?" },
+          { style: "funny", text: "Well, that text woke me up properly. What's going on?" },
+          { style: "chill", text: "okay, let's talk — what's up?" },
         ],
       };
     default:
@@ -1575,6 +1799,14 @@ function formatRizzResult(data, mode) {
   const tip = typeof data?.tip === "string" && data.tip.trim()
     ? data.tip.trim().slice(0, 280)
     : tipFallback;
+  const verdictRaw = typeof data?.verdict === "string" ? data.verdict.trim().toLowerCase() : "";
+  const verdict = ["send", "tweak", "wait", "dont"].indexOf(verdictRaw) !== -1 ? verdictRaw : "tweak";
+  const lands = typeof data?.lands === "string" && data.lands.trim()
+    ? data.lands.trim().slice(0, 280)
+    : "It reads fine, but a small tweak would make it land better.";
+  const dontSend = typeof data?.dontSend === "string" && data.dontSend.trim()
+    ? data.dontSend.trim().slice(0, 200)
+    : "";
   const FALLBACK_REPLIES = {
     smooth: "Hey — saw your post and it made me smile. What are you up to this weekend?",
     funny: "Okay, I admit it, I stared at this text for five minutes before sending it. How's your day going?",
@@ -1593,6 +1825,9 @@ function formatRizzResult(data, mode) {
     roast: roast,
     signal: signal,
     tip: tip,
+    verdict: verdict,
+    lands: lands,
+    dontSend: dontSend,
     mode: m,
     replies: [
       { style: "smooth", text: pickReply("smooth", 0) },
@@ -1617,6 +1852,12 @@ app.post("/rizz", analyzeLimiter, async (req, res) => {
     }
     const styleSample = sanitiseStyleSample(body.styleSample);
     if (styleSample.error) return res.status(400).json({ error: styleSample.error });
+    const personContext = sanitisePersonContext(body.personContext);
+    if (personContext.error) return res.status(400).json({ error: personContext.error });
+    const styleExamples = sanitiseStyleExamples(body.styleExamples);
+    if (styleExamples.error) return res.status(400).json({ error: styleExamples.error });
+    const context = sanitiseRizzContext(body.context);
+    if (context.error) return res.status(400).json({ error: context.error });
     const limitCheck = await checkSignedInDailyLimit(req);
     if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
     if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
@@ -1633,7 +1874,7 @@ app.post("/rizz", analyzeLimiter, async (req, res) => {
         response_format: { type: "json_object" },
         temperature: 0.8,
         messages: [
-          { role: "system", content: buildModePrompt(mode, text, styleSample.value) },
+          { role: "system", content: buildModePrompt(mode, text, styleSample.value, { personContext: personContext.value, styleExamples: styleExamples.value, context: context.value }) },
           { role: "user", content: "Rate this DM:\n\n" + text },
         ],
       });
@@ -1691,11 +1932,14 @@ function sanitiseShotImage(image, mimeType) {
   if (decodedBytes > SHOT_MAX_IMAGE_BYTES) return { error: "That screenshot is too large — try a smaller one (max 2MB).", status: 413 };
   return { image: "data:" + mime + ";base64," + b64, mime: mime };
 }
-function buildShotPrompt(styleSample) {
-  const styleLine = styleSample ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+function buildShotPrompt(styleSample, opts) {
+  const o = opts || {};
+  const styleLine = (styleSample && !o.styleExamples) ? "\nWrite the replies in the user's own texting style: " + styleSample + "\n" : "";
+  const personLine = o.personContext ? "\nThis screenshot is about: " + o.personContext + " — write replies that fit that person and what you know about them.\n" : "";
+  const examplesLine = o.styleExamples ? "\nHere are real texts the user actually sent — copy their voice exactly (punctuation, capitalisation, length, slang):\n" + o.styleExamples + "\n" : "";
   return `You are BeforeYouSay — a playful Gen Z texting coach that helps people sound like themselves, only better.
 Read this conversation screenshot and judge the vibe — who is interested, who is pulling away, and what the user should send back.
-${styleLine}
+${styleLine}${personLine}${examplesLine}
 Return valid JSON only in this exact structure:
 {
   "score": 0-100,
@@ -1703,6 +1947,9 @@ Return valid JSON only in this exact structure:
   "roast": "string — one line reading what is actually happening in the conversation",
   "signal": "string — one line on what the other person is signalling",
   "tip": "string — one line: what the user should do differently next time",
+  "verdict": "send | tweak | wait | dont — whether the user should send this message as written",
+  "lands": "string — one line on how the message reads to the recipient",
+  "dontSend": "string — one line naming the specific thing NOT to send or do, or an empty string if there is nothing specific",
   "replies": [
     { "style": "smooth", "text": "string — a smooth reply the user can send next, sendable as written" },
     { "style": "funny", "text": "string — a funny reply the user can send next, sendable as written" },
@@ -1714,6 +1961,9 @@ Rules:
 - The read is light and funny, never cruel. Never mock anyone's looks, body, money, background, or identity. Nothing sexualised, no slurs.
 - Never help the user deceive, harass, manipulate, or cheat anyone.
 - All three replies keep the user's intent and sound like a real person texting, not a movie pickup line. Keep each reply under 200 characters.
+- Write like a real person texting, not a corporate email or a therapy session. No cliches ("at the end of the day", "just checking in", "circle back"), no therapy-speak ("I hear you", "holding space"), no LinkedIn voice, no metaphors, no paragraphs. No exclamation-mark overload — at most one exclamation mark across all three replies, and usually none.
+- The "chill" reply must be under 12 words. All replies stay short, slightly imperfect, and lowercase-friendly — real texting, not a polished speech.
+- Return verdict "dont" when the message should not be sent at all — for example texting someone who told them no, a blocked contact, or a third unanswered message in a row. Say so plainly in "lands" and name the specific thing to avoid in "dontSend".
 - Keep the read, the signal and the tip short — this is a quick check, not an essay.`;
 }
 function buildMockShotResult() {
@@ -1724,6 +1974,9 @@ function buildMockShotResult() {
     roast: "They are asking questions back — that is not politeness, that is interest.",
     signal: "The conversation has momentum; they are matching your energy.",
     tip: "Reply to the last thing they said, then ask one question back.",
+    verdict: "tweak",
+    lands: "Warm, but your next reply needs a question to keep it moving.",
+    dontSend: "",
     mode: "shot",
     replies: [
       { style: "smooth", text: "Haha fair enough — what are you up to tonight?" },
@@ -1741,6 +1994,10 @@ app.post("/check-shot", analyzeLimiter, async (req, res) => {
     if (checked.error) return res.status(checked.status).json({ error: checked.error });
     const styleSample = sanitiseStyleSample(body.styleSample);
     if (styleSample.error) return res.status(400).json({ error: styleSample.error });
+    const personContext = sanitisePersonContext(body.personContext);
+    if (personContext.error) return res.status(400).json({ error: personContext.error });
+    const styleExamples = sanitiseStyleExamples(body.styleExamples);
+    if (styleExamples.error) return res.status(400).json({ error: styleExamples.error });
     const limitCheck = await checkSignedInDailyLimit(req);
     if (limitCheck.blocked) return res.status(429).json(limitCheck.body);
     if (!limitCheck.signedIn && !guestAnalyzeAllowed(req)) {
@@ -1753,7 +2010,7 @@ app.post("/check-shot", analyzeLimiter, async (req, res) => {
     if (visionProvider.provider === "none") {
       return res.status(500).json({ error: "AI service is not configured." });
     }
-    const shotPrompt = buildShotPrompt(styleSample.value);
+    const shotPrompt = buildShotPrompt(styleSample.value, { personContext: personContext.value, styleExamples: styleExamples.value });
     let raw = null;
     if (visionProvider.provider === "gemini") {
       raw = await callGeminiVision(shotPrompt, [checked.image]);
