@@ -673,6 +673,7 @@ app.post("/delete-account", deleteLimiter, async (req, res) => {
   const rows = await Promise.all([
     supabaseAdminDeleteRows("history", "user_id", userId),
     supabaseAdminDeleteRows("contexts", "user_id", userId),
+    supabaseAdminDeleteRows("people", "user_id", userId),
     supabaseAdminDeleteRows("profiles", "id", userId),
   ]);
   const rowsDeleted = rows.every(Boolean);
@@ -2077,6 +2078,255 @@ app.post("/check-shot", analyzeLimiter, async (req, res) => {
     else console.error("Shot error:", error && error.message ? error.message : error);
     const mapped = mapVisionUpstreamError(error);
     return res.status(mapped.status).json({ error: mapped.error });
+  }
+});
+
+/* ---------- Cloud people memory: POST /people/summary ----------
+   Rewrites one person's rolling summary after a check (or after an
+   outcome is tapped). Signed-in only — the Supabase session is
+   checked the same way /delete-account does it (GET /auth/v1/user
+   with the service-role key), because SUPABASE_JWT_SECRET is not set
+   on Render so the HS256 check cannot run. Guests get 401.
+   The row is loaded with the service-role key — a client-supplied
+   summary is never trusted. The model (gpt-5.4-nano, same text model
+   as /rizz) rewrites the summary from the old summary + this check +
+   the outcome, in <=500 chars. The endpoint only writes the summary
+   (+ last_outcome / last_checked_at when an outcome is given); the
+   outcome COUNTS are owned by the frontend's people sync, so nothing
+   is ever double-counted.
+   Cap: 20 rewrites per user per UTC day, in memory (a runaway loop
+   must not be possible). A summary is called at most twice per check
+   (once after the check, once after an outcome), and a free user gets
+   10 checks a day — so 20 covers every real user and nothing more.
+   The shared 20/15min limiter applies too. A failure is silent on
+   the frontend (the summary just stays as it was) — this endpoint
+   must never block or delay a check result.
+   MOCK_AI (local testing only): the people store is an in-memory Map
+   keyed by userId + personId, and a missing row is auto-created for
+   the caller, so the endpoint can be exercised without Supabase.
+   Production mode returns 404 for a missing row or a row that
+   belongs to someone else. */
+const PERSON_SUMMARY_JSON_SCHEMA = {
+  type: "object",
+  properties: { summary: { type: "string" } },
+  required: ["summary"],
+  additionalProperties: false
+};
+const PEOPLE_SUMMARY_DAILY_CAP = 20;
+const peopleSummaryCounts = new Map(); /* userId + UTC date -> { count, at } */
+function peopleSummaryCapKey(userId, now) {
+  const d = new Date(now);
+  return userId + "|" + d.getUTCFullYear() + "-" + (d.getUTCMonth() + 1) + "-" + d.getUTCDate();
+}
+function peopleSummaryAllowed(userId) {
+  const key = peopleSummaryCapKey(userId, new Date());
+  const now = Date.now();
+  if (peopleSummaryCounts.size > 1000) {
+    peopleSummaryCounts.forEach(function (entry, k) { if (now - entry.at > 48 * 60 * 60 * 1000) peopleSummaryCounts.delete(k); });
+  }
+  let entry = peopleSummaryCounts.get(key);
+  if (!entry) { entry = { count: 0, at: now }; peopleSummaryCounts.set(key, entry); }
+  if (entry.count >= PEOPLE_SUMMARY_DAILY_CAP) return false;
+  entry.count += 1;
+  return true;
+}
+function buildPersonSummaryPrompt(oldSummary, checkText, outcome, mode) {
+  /* The prompt text lives inside this function on purpose: the logic
+     tests extract this function and run it standalone, so it cannot
+     read a module-level const. */
+  const m = mode || "rizz";
+  const oldBlock = oldSummary ? "Current summary of this person:\n---\n" + oldSummary + "\n---" : "There is no summary of this person yet.";
+  const outcomeBlock = outcome ? "What happened after they sent it: " + outcome + "." : "No outcome is known yet — they have not said what happened.";
+  return `You keep a short private note about one person the user texts, so future checks remember them. Rewrite the note from what is below. Return only JSON matching the schema. No markdown.
+
+${oldBlock}
+
+Latest check (mode: ${m}):
+---
+${checkText}
+---
+${outcomeBlock}
+
+Rules — follow all of them:
+- Only write what the checks and outcomes actually show. Never invent facts about this person — no job, age, city, family, or history that was not in a check.
+- Short plain lines: how they text, what landed, what to avoid.
+- No names of other people. No names at all except the person's own name if it was already in the summary.
+- Never write a paragraph. Never flirt, never roast, never judge the user.
+- If there is not enough to say, return the old summary unchanged. If there was no old summary and there is not enough to say, return an empty string.
+- The summary is at most 500 characters.`;
+}
+function sanitisePersonSummaryInput(body) {
+  if (!body || typeof body !== "object") return { error: "Add the person and the check first." };
+  const personId = typeof body.personId === "string" ? body.personId.trim() : "";
+  if (!personId) return { error: "Add the person first." };
+  const checkText = typeof body.checkText === "string" ? body.checkText.trim() : "";
+  if (!checkText) return { error: "Add the check first." };
+  if (checkText.length > 1000) return { error: "Keep the check under 1000 characters." };
+  const outcome = typeof body.outcome === "string" && body.outcome ? body.outcome : null;
+  if (outcome && ["warm", "cold", "nothing", "plans"].indexOf(outcome) === -1) return { error: "Pick a valid outcome." };
+  const mode = typeof body.mode === "string" && body.mode.trim() ? body.mode.trim() : "rizz";
+  if (mode !== "shot" && mode !== "rizz" && !RIZZ_MODE_DEFS[mode]) return { error: "Pick a valid check mode." };
+  return { personId: personId, checkText: checkText, outcome: outcome, mode: mode };
+}
+function validatePersonSummary(raw, oldSummary) {
+  /* The model answer must be an object with a string summary. An
+     empty summary keeps the old one — "not enough to say" is a
+     valid answer, not an error. */
+  if (!raw || typeof raw !== "object" || typeof raw.summary !== "string") return null;
+  const s = raw.summary.trim().slice(0, 500);
+  if (!s) return { summary: oldSummary || "" };
+  return { summary: s };
+}
+const mockPeopleStore = new Map(); /* MOCK_AI only: userId + "\0" + personId -> row */
+function mockPersonStoreGet(userId, personId) {
+  return mockPeopleStore.get(userId + "\0" + personId) || null;
+}
+function mockPersonStorePut(userId, personId, row) {
+  /* Never let one user claim a personId that already belongs to
+     another user — the mock must behave like the production query
+     (id + user_id), or the ownership check is untestable. Returns
+     null when the id is taken, so the caller answers 404. */
+  for (const existing of mockPeopleStore.values()) {
+    if (existing.id === personId && existing.user_id !== userId) return null;
+  }
+  mockPeopleStore.set(userId + "\0" + personId, row);
+  return row;
+}
+async function supabasePeopleGetRow(userId, personId) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/people?id=eq." + encodeURIComponent(personId) + "&user_id=eq." + encodeURIComponent(userId) + "&select=*", {
+      headers: { apikey: key, Authorization: "Bearer " + key },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (e) { return null; }
+}
+async function supabasePeoplePatchRow(userId, personId, fields) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return false;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/people?id=eq." + encodeURIComponent(personId) + "&user_id=eq." + encodeURIComponent(userId), {
+      method: "PATCH",
+      headers: { apikey: key, Authorization: "Bearer " + key, "Content-Type": "application/json", Prefer: "return=representation" },
+      body: JSON.stringify(fields),
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+function mockSummaryText(oldSummary, checkText, outcome) {
+  /* MOCK_AI canned rewrite — deterministic, clearly a sample. Keeps
+     the old summary when there is one; otherwise says plainly that
+     there is not enough yet. Never invents a fact about the person. */
+  const base = (oldSummary || "").trim();
+  const tail = outcome ? " Last outcome: " + outcome + "." : "";
+  const s = (base ? base + tail : "Not enough checks yet to say anything about this person." + tail).trim();
+  return { summary: s.slice(0, 500) };
+}
+async function rewritePersonSummary(deps, input) {
+  /* Core logic, dependencies injected so the tests can run it without
+     Supabase or OpenAI. deps: { getRow, patchRow, callModel, isMock }.
+     Returns { status, body } — the route sends it as-is. */
+  const row = await deps.getRow(input.userId, input.personId);
+  if (!row) return { status: 404, body: { error: "That person wasn't found." } };
+  const oldSummary = typeof row.summary === "string" ? row.summary : "";
+  let rewritten;
+  if (deps.isMock) {
+    rewritten = mockSummaryText(oldSummary, input.checkText, input.outcome);
+  } else {
+    if (!deps.callModel) return { status: 500, body: { error: "AI service is not configured." } };
+    let parsed = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let raw = null;
+      try {
+        raw = await deps.callModel(buildPersonSummaryPrompt(oldSummary, input.checkText, input.outcome, input.mode));
+      } catch (e) {
+        console.error("Person summary provider error:", e && e.message ? e.message : e);
+        return { status: 500, body: { error: "The summary couldn't be updated — please try again." } };
+      }
+      if (!raw) { console.error("Person summary empty model response (attempt " + (attempt + 1) + ")"); continue; }
+      try { parsed = JSON.parse(raw); } catch (parseError) { console.error("Person summary JSON parse error:", parseError.message); continue; }
+      const checked = validatePersonSummary(parsed, oldSummary);
+      if (checked) { rewritten = checked; break; }
+      console.error("Person summary failed schema validation (attempt " + (attempt + 1) + ")");
+    }
+    if (!rewritten) return { status: 500, body: { error: "The summary couldn't be updated — please try again." } };
+  }
+  const fields = { summary: rewritten.summary, last_checked_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+  if (input.outcome) fields.last_outcome = input.outcome;
+  const ok = await deps.patchRow(input.userId, input.personId, fields);
+  if (!ok) return { status: 500, body: { error: "The summary couldn't be saved — please try again." } };
+  return { status: 200, body: { summary: rewritten.summary } };
+}
+app.post("/people/summary", analyzeLimiter, async (req, res) => {
+  try {
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.MOCK_AI !== "true") {
+      return res.status(503).json({ error: "People sync is not set up on the server yet." });
+    }
+    const h = req.headers.authorization || "";
+    if (!h.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Sign in to sync people." });
+    }
+    const token = h.slice(7).trim();
+    let user = null;
+    if (process.env.MOCK_AI === "true" && token.indexOf("mock-user-") === 0) {
+      /* MOCK_AI only: a test token "mock-user-<uuid>" stands in for a
+         signed-in user, so the endpoint can be exercised without
+         Supabase. Never honoured in production. */
+      user = { id: token.slice("mock-user-".length) || null, email: null };
+      if (!user.id) user = null;
+    } else {
+      user = await getSupabaseUserFromToken(token);
+    }
+    if (!user || !user.id) {
+      return res.status(401).json({ error: "Sign in to sync people." });
+    }
+    const input = sanitisePersonSummaryInput(req.body || {});
+    if (input.error) return res.status(400).json({ error: input.error });
+    if (!peopleSummaryAllowed(user.id)) {
+      return res.status(429).json({ error: "Too many summary updates today — they start again tomorrow." });
+    }
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      isMock: true,
+      getRow: async function (userId, personId) {
+        let row = mockPersonStoreGet(userId, personId);
+        if (!row) { row = mockPersonStorePut(userId, personId, { id: personId, user_id: userId, summary: "" }); }
+        return row;
+      },
+      patchRow: async function (userId, personId, fields) {
+        const row = mockPersonStoreGet(userId, personId) || { id: personId, user_id: userId, summary: "" };
+        Object.keys(fields).forEach(function (k) { row[k] = fields[k]; });
+        mockPersonStorePut(userId, personId, row);
+        return true;
+      },
+      callModel: null,
+    } : {
+      isMock: false,
+      getRow: supabasePeopleGetRow,
+      patchRow: supabasePeoplePatchRow,
+      callModel: client ? async function (prompt) {
+        const response = await client.chat.completions.create({
+          model: OPENAI_TEXT_MODEL,
+          response_format: { type: "json_schema", json_schema: { name: "person_summary", strict: true, schema: PERSON_SUMMARY_JSON_SCHEMA } },
+          temperature: 0.3,
+          messages: [
+            { role: "system", content: prompt },
+            { role: "user", content: "Rewrite the note from the check above." },
+          ],
+        });
+        return response && response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content : null;
+      } : null,
+    };
+    const result = await rewritePersonSummary(deps, { userId: user.id, personId: input.personId, checkText: input.checkText, outcome: input.outcome, mode: input.mode });
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Person summary error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "The summary couldn't be updated — please try again." });
   }
 });
 
