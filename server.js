@@ -19,6 +19,11 @@ const voteLimiter = rateLimit({
   max: 30,
   message: { error: "Too many requests. Please try again later." },
 });
+const passLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: "Too many requests. Please try again later." },
+});
 app.use(cors({
   origin: ["https://beforeyousay.com", "http://localhost:3000"],
   methods: ["GET", "POST"],
@@ -1165,7 +1170,7 @@ async function checkSignedInDailyLimit(req) {
      they now run in parallel instead of one after the other — one fewer
      Supabase round trip before every signed-in check. Either failing
      still fails open (see below); a Pro plan still skips the limit. */
-  const [plan, used] = await Promise.all([
+  const [plan, used, passBonus] = await Promise.all([
     (async () => {
       try {
         const planRes = await fetch(SUPABASE_URL + "/rest/v1/profiles?select=plan&id=eq." + encodeURIComponent(user.id), {
@@ -1178,10 +1183,15 @@ async function checkSignedInDailyLimit(req) {
       } catch (e) { return null; /* fail open */ }
     })(),
     supabaseCountToday(user.id),
+    supabaseFriendPassBonusGet("user:" + user.id, utcDayKey(new Date())),
   ]);
   if (isProPlan(plan)) return { blocked: false, signedIn: true };
   if (used === null) return { blocked: false, signedIn: true }; /* fail open */
-  if (used >= FREE_SIGNED_IN_DAILY_LIMIT) return { blocked: true, body: limitErrorBody(FREE_SIGNED_IN_DAILY_LIMIT, used), signedIn: true };
+  /* Friend pass (28 Nov 2026): a claimed pass adds +3 checks for
+     today on top of the 10-check base. The bonus lookup fails open
+     (null -> 0), so a lookup failure never blocks a real user. */
+  const effectiveLimit = effectiveDailyLimit(FREE_SIGNED_IN_DAILY_LIMIT, passBonus);
+  if (used >= effectiveLimit) return { blocked: true, body: limitErrorBody(effectiveLimit, used), signedIn: true };
   return { blocked: false, signedIn: true };
 }
 /* ---------- Sprint 2 fix pass: guest hourly limit on the analyse endpoints ----------
@@ -2766,6 +2776,410 @@ app.post("/vote-cards/:id/vote", voteLimiter, async (req, res) => {
   } catch (error) {
     console.error("Vote error:", error && error.message ? error.message : error);
     return res.status(500).json({ error: "Your vote couldn't be saved — please try again." });
+  }
+});
+/* ---------- Friend pass: POST /friend-pass, GET /pass/:id, POST /pass/:id/claim, GET /friend-pass/bonus ----------
+   Grok's idea (28 Nov 2026), Sagar's pick: "Send one check to a
+   friend. You both get 3 more today."
+   The giver taps "Send a friend pass" and gets a link #/pass/<id>.
+   The friend opens it and claims: both sides get +3 checks for
+   that UTC day only, on top of the normal daily limit (guests
+   5/day, signed-in 10/day).
+   Rules, all enforced server-side, never trusted from the browser:
+   - one pass per giver per UTC day (a unique index on
+     (giver_key, day) is the backstop; the app checks first);
+   - each pass is redeemable exactly once (the claim RPC updates
+     the row only where redeemed_at is null, and raises
+     'already claimed' otherwise);
+   - a pass expires at the end of its UTC day (a read or claim of
+     an expired pass answers expired and the row is deleted
+     best-effort);
+   - the giver cannot redeem their own pass;
+   - the giver is identified by their signed-in user id when
+     signed in, else by IP — the same basis the guest limits use.
+     The giver key is stored server-side and never accepted from
+     a request body (a body carrying giver_key is ignored);
+   - no draft, no message, no names are ever stored in a pass.
+   Storage: friend_passes (migration 007) + friend_pass_bonus
+   (key, day, bonus) for the +3 bookkeeping. RLS on, no select or
+   insert policies — the frontend never touches either table; the
+   backend uses the service-role key. The claim moves only through
+   the SECURITY DEFINER claim_friend_pass RPC (migration 007),
+   granted EXECUTE to service_role only, which marks the pass
+   redeemed and credits both bonuses in one transaction.
+   The id is server-generated: 16 characters from [A-Za-z0-9_-]
+   (12 random bytes, base64url) — the same generator as vote
+   cards, inside the 12-22 char CHECK.
+   Pass creation is rate-limited (5 creates per 15 min per IP);
+   claims use the vote limiter (30 per 15 min per IP); reads are
+   unthrottled. Without the service-role key (and not MOCK_AI)
+   the write routes answer 503.
+   The signed-in daily limit (checkSignedInDailyLimit) adds the
+   caller's bonus for today to the 10-check base; guests get the
+   bonus through the frontend's local count (guests are limited
+   only in the frontend — see index.html). The guest 5/hour
+   server cap is untouched: the pass adds daily checks, not
+   burst room.
+   MOCK_AI (local testing only): passes and bonuses live in
+   in-memory Maps with the same rules. */
+const FRIEND_PASS_BONUS = 3;
+const SUPABASE_TIMEOUT_MS = 5000; /* shared Supabase REST timeout for the friend-pass helpers */
+const mockPassStore = new Map(); /* MOCK_AI only: id -> friend pass row */
+const mockBonusStore = new Map(); /* MOCK_AI only: key + "\0" + day -> bonus int */
+function utcDayKey(d) {
+  const x = d instanceof Date ? d : new Date(d || Date.now());
+  return x.getUTCFullYear() + "-" + String(x.getUTCMonth() + 1).padStart(2, "0") + "-" + String(x.getUTCDate()).padStart(2, "0");
+}
+function isValidFriendPassId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9_-]{12,22}$/.test(id);
+}
+function generateFriendPassId() {
+  /* 12 random bytes -> 16 base64url chars, alphabet [A-Za-z0-9_-]. */
+  return crypto.randomBytes(12).toString("base64url");
+}
+function isExpiredFriendPass(row, now) {
+  /* Pure, so the tests can call it standalone: a pass is expired
+     when its day is not today's UTC day. */
+  if (!row || typeof row.day !== "string") return false;
+  return row.day !== utcDayKey(now || new Date());
+}
+function effectiveDailyLimit(baseLimit, bonus) {
+  /* Pure: the base limit plus today's friend-pass bonus (0 when
+     the lookup failed or there is no bonus). */
+  const b = typeof bonus === "number" && bonus > 0 ? Math.floor(bonus) : 0;
+  return baseLimit + b;
+}
+async function resolveFriendPassIdentity(req) {
+  /* Signed-in (valid token) -> "user:<id>"; otherwise the IP.
+     MOCK_AI only: "mock-user-<id>" tokens stand in for a signed-in
+     user, exactly as in /people/summary. Never honoured in
+     production. The identity never comes from the request body. */
+  const h = req.headers.authorization || "";
+  if (h.startsWith("Bearer ")) {
+    const token = h.slice(7).trim();
+    if (process.env.MOCK_AI === "true" && token.indexOf("mock-user-") === 0) {
+      const id = token.slice("mock-user-".length);
+      if (id) return { key: "user:" + id, kind: "user" };
+    } else if (process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      const user = await getSupabaseUserFromToken(token);
+      if (user && user.id) return { key: "user:" + user.id, kind: "user" };
+    }
+  }
+  return { key: "ip:" + ((req && req.ip) || "unknown"), kind: "ip" };
+}
+function supabasePassHeaders(key) {
+  return { apikey: key, Authorization: "Bearer " + key };
+}
+async function supabaseFriendPassGetRow(id) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/friend_passes?id=eq." + encodeURIComponent(id) + "&select=*", {
+      headers: supabasePassHeaders(key),
+      signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (e) { return null; }
+}
+async function supabaseFriendPassInsertRow(row) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/friend_passes", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json", Prefer: "return=representation" }, supabasePassHeaders(key)),
+      body: JSON.stringify(row),
+      signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : row;
+  } catch (e) { return null; }
+}
+async function supabaseFriendPassGetByGiverDay(giverKey, day) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/friend_passes?giver_key=eq." + encodeURIComponent(giverKey) + "&day=eq." + encodeURIComponent(day) + "&select=id", {
+      headers: supabasePassHeaders(key),
+      signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (e) { return null; }
+}
+async function supabaseFriendPassClaim(id, redeemerKey) {
+  /* Calls the SECURITY DEFINER claim_friend_pass RPC (migration
+     007) with the service-role key. Returns { bonus: 3 } on
+     success, { notFound: true } / { expired: true } /
+     { alreadyClaimed: true } / { ownPass: true } when the RPC
+     raises the matching message, or null on any other failure.
+     The RPC — never the browser — marks the pass redeemed and
+     credits both bonuses. */
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/rpc/claim_friend_pass", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, supabasePassHeaders(key)),
+      body: JSON.stringify({ pass_id: id, redeemer_key: redeemerKey }),
+      signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+    });
+    const data = await res.json().catch(function () { return null; });
+    if (!res.ok) {
+      const msg = data && typeof data.message === "string" ? data.message : "";
+      if (msg.indexOf("pass not found") !== -1) return { notFound: true };
+      if (msg.indexOf("pass expired") !== -1) return { expired: true };
+      if (msg.indexOf("already claimed") !== -1) return { alreadyClaimed: true };
+      if (msg.indexOf("own pass") !== -1) return { ownPass: true };
+      return null;
+    }
+    return { bonus: typeof data === "number" ? data : FRIEND_PASS_BONUS };
+  } catch (e) { return null; }
+}
+async function supabaseFriendPassBonusGet(bonusKey, day) {
+  /* Returns the stored bonus int for (key, day), 0 when there is
+     no row, null when the lookup fails (fail open). */
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/friend_pass_bonus?key=eq." + encodeURIComponent(bonusKey) + "&day=eq." + encodeURIComponent(day) + "&select=bonus", {
+      headers: supabasePassHeaders(key),
+      signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (Array.isArray(rows) && rows[0] && typeof rows[0].bonus === "number") return rows[0].bonus;
+    return 0;
+  } catch (e) { return null; }
+}
+async function supabaseFriendPassDeleteRow(id) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return false;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/friend_passes?id=eq." + encodeURIComponent(id), {
+      method: "DELETE",
+      headers: supabasePassHeaders(key),
+      signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+async function supabaseFriendPassPruneOld() {
+  /* One opportunistic cleanup delete: passes from before today
+     (UTC). Best-effort — the caller swallows failures, so a
+     cleanup failure never breaks a create or a claim. */
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return false;
+  try {
+    const today = utcDayKey(new Date());
+    const res = await fetch(SUPABASE_URL + "/rest/v1/friend_passes?day=lt." + encodeURIComponent(today), {
+      method: "DELETE",
+      headers: supabasePassHeaders(key),
+      signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+function mockBonusKey(key, day) { return key + "\0" + day; }
+function mockBonusGet(key, day) {
+  const v = mockBonusStore.get(mockBonusKey(key, day));
+  return typeof v === "number" ? v : 0;
+}
+function mockBonusAdd(key, day, n) {
+  mockBonusStore.set(mockBonusKey(key, day), mockBonusGet(key, day) + n);
+  return mockBonusGet(key, day);
+}
+function mockPassPruneOld() {
+  /* MOCK_AI twin of supabaseFriendPassPruneOld: drop passes from
+     before today (UTC) from the in-memory Map. Returns true. */
+  const today = utcDayKey(new Date());
+  mockPassStore.forEach(function (row, id) {
+    if (row && typeof row.day === "string" && row.day < today) mockPassStore.delete(id);
+  });
+  return true;
+}
+async function createFriendPass(deps, giver) {
+  /* Core logic, dependencies injected so the tests can run it
+     without Supabase. deps: { getRow, getPassByGiverDay,
+     insertRow, generateId, pruneOld? }. Returns { status, body }
+     — the route sends it as-is. The giver comes from the route
+     (token or IP); the request body is never read here, so a
+     body carrying giver_key is ignored outright. */
+  const today = utcDayKey(new Date());
+  if (!deps || typeof deps.getPassByGiverDay !== "function" || typeof deps.insertRow !== "function" || typeof deps.generateId !== "function" || typeof deps.getRow !== "function") {
+    return { status: 500, body: { error: "The friend pass couldn't be created — please try again." } };
+  }
+  const existing = await deps.getPassByGiverDay(giver.key, today);
+  if (existing) return { status: 409, body: { error: "You've already sent a friend pass today — you can send another one tomorrow." } };
+  let id = deps.generateId();
+  if (!isValidFriendPassId(id) || await deps.getRow(id)) {
+    /* Bad format or an id collision (rare, but possible):
+       regenerate once, then give up rather than looping forever. */
+    id = deps.generateId();
+    if (!isValidFriendPassId(id) || await deps.getRow(id)) return { status: 500, body: { error: "The friend pass couldn't be created — please try again." } };
+  }
+  const row = { id: id, giver_key: giver.key, giver_kind: giver.kind, redeemer_key: null, day: today, created_at: new Date().toISOString(), redeemed_at: null };
+  const saved = await deps.insertRow(row);
+  if (!saved) return { status: 500, body: { error: "The friend pass couldn't be created — please try again." } };
+  /* Opportunistic cleanup of expired passes: failures are
+     swallowed so a cleanup failure never breaks a create. */
+  if (deps && typeof deps.pruneOld === "function") { try { await deps.pruneOld(); } catch (e) { /* ignore */ } }
+  return { status: 201, body: { id: id, url: "/#/pass/" + id } };
+}
+async function getFriendPassState(deps, id) {
+  /* Core logic, dependencies injected. deps: { getRow, deleteRow? }.
+     Returns { status, body } — the route sends it as-is. An
+     expired pass answers state "expired" (and is deleted
+     best-effort); a missing pass answers 404. */
+  if (typeof id !== "string" || !id) return { status: 404, body: { error: "That friend pass doesn't exist." } };
+  const row = await deps.getRow(id);
+  if (!row) return { status: 404, body: { error: "That friend pass doesn't exist." } };
+  if (isExpiredFriendPass(row)) {
+    if (deps && typeof deps.deleteRow === "function") { try { await deps.deleteRow(id); } catch (e) { /* ignore */ } }
+    return { status: 200, body: { id: row.id, state: "expired", day: row.day } };
+  }
+  const state = row.redeemed_at ? "claimed" : "valid";
+  return { status: 200, body: { id: row.id, state: state, day: row.day } };
+}
+async function claimFriendPass(deps, id, redeemer) {
+  /* Core logic, dependencies injected. deps: { getRow, claimRow,
+     getBonusToday?, deleteRow? }. Returns { status, body } — the
+     route sends it as-is. The claim moves ONLY through claimRow
+     (the RPC in production, the atomic in-memory claim in MOCK):
+     the request carries no identity and no totals, and the bonus
+     is credited by the claim, never read from a request body. */
+  if (typeof id !== "string" || !id) return { status: 404, body: { error: "That friend pass doesn't exist." } };
+  if (!deps || typeof deps.claimRow !== "function" || typeof deps.getRow !== "function") {
+    return { status: 500, body: { error: "The friend pass couldn't be claimed — please try again." } };
+  }
+  const row = await deps.getRow(id);
+  if (!row) return { status: 404, body: { error: "That friend pass doesn't exist." } };
+  if (isExpiredFriendPass(row)) {
+    if (deps && typeof deps.deleteRow === "function") { try { await deps.deleteRow(id); } catch (e) { /* ignore */ } }
+    return { status: 410, body: { error: "That friend pass expired — passes only last for the day they're sent." } };
+  }
+  if (row.redeemed_at) return { status: 409, body: { error: "That friend pass was already claimed." } };
+  if (row.giver_key === redeemer.key) return { status: 400, body: { error: "That's your own pass — send it to a friend instead." } };
+  const result = await deps.claimRow(id, redeemer.key);
+  if (!result) return { status: 500, body: { error: "The friend pass couldn't be claimed — please try again." } };
+  if (result.notFound) return { status: 404, body: { error: "That friend pass doesn't exist." } };
+  if (result.expired) return { status: 410, body: { error: "That friend pass expired — passes only last for the day they're sent." } };
+  if (result.alreadyClaimed) return { status: 409, body: { error: "That friend pass was already claimed." } };
+  if (result.ownPass) return { status: 400, body: { error: "That's your own pass — send it to a friend instead." } };
+  const today = utcDayKey(new Date());
+  let yourBonus = null;
+  let giverBonus = null;
+  if (typeof deps.getBonusToday === "function") {
+    try { yourBonus = await deps.getBonusToday(redeemer.key, today); } catch (e) { yourBonus = null; }
+    try { giverBonus = await deps.getBonusToday(row.giver_key, today); } catch (e) { giverBonus = null; }
+  }
+  return { status: 200, body: { ok: true, bonus: FRIEND_PASS_BONUS, yourBonusToday: yourBonus, giverBonusToday: giverBonus } };
+}
+app.post("/friend-pass", passLimiter, async (req, res) => {
+  try {
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.MOCK_AI !== "true") {
+      return res.status(503).json({ error: "Friend passes are not set up on the server yet." });
+    }
+    const giver = await resolveFriendPassIdentity(req);
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      getRow: async function (id) { return mockPassStore.get(id) || null; },
+      getPassByGiverDay: async function (giverKey, day) {
+        let found = null;
+        mockPassStore.forEach(function (row) { if (row.giver_key === giverKey && row.day === day) found = row; });
+        return found;
+      },
+      insertRow: async function (row) { mockPassStore.set(row.id, row); return row; },
+      generateId: generateFriendPassId,
+      pruneOld: async function () { return mockPassPruneOld(); },
+    } : {
+      getRow: supabaseFriendPassGetRow,
+      getPassByGiverDay: supabaseFriendPassGetByGiverDay,
+      insertRow: supabaseFriendPassInsertRow,
+      generateId: generateFriendPassId,
+      pruneOld: supabaseFriendPassPruneOld,
+    };
+    const result = await createFriendPass(deps, giver);
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Friend pass create error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "The friend pass couldn't be created — please try again." });
+  }
+});
+app.get("/pass/:id", async (req, res) => {
+  try {
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      getRow: async function (id) { return mockPassStore.get(id) || null; },
+      deleteRow: async function (id) { return mockPassStore.delete(id); },
+    } : {
+      getRow: supabaseFriendPassGetRow,
+      deleteRow: supabaseFriendPassDeleteRow,
+    };
+    const result = await getFriendPassState(deps, req.params.id);
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Friend pass read error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "That friend pass couldn't be loaded — please try again." });
+  }
+});
+app.post("/pass/:id/claim", voteLimiter, async (req, res) => {
+  try {
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.MOCK_AI !== "true") {
+      return res.status(503).json({ error: "Friend passes are not set up on the server yet." });
+    }
+    const redeemer = await resolveFriendPassIdentity(req);
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      getRow: async function (id) { return mockPassStore.get(id) || null; },
+      deleteRow: async function (id) { return mockPassStore.delete(id); },
+      claimRow: async function (id, redeemerKey) {
+        /* MOCK_AI twin of the claim_friend_pass RPC: the check
+           and the update happen together, so a second claim of
+           the same pass loses here, exactly as in production. */
+        const row = mockPassStore.get(id);
+        if (!row) return { notFound: true };
+        if (isExpiredFriendPass(row)) return { expired: true };
+        if (row.redeemed_at) return { alreadyClaimed: true };
+        if (row.giver_key === redeemerKey) return { ownPass: true };
+        row.redeemer_key = redeemerKey;
+        row.redeemed_at = new Date().toISOString();
+        const today = utcDayKey(new Date());
+        mockBonusAdd(row.giver_key, today, FRIEND_PASS_BONUS);
+        mockBonusAdd(redeemerKey, today, FRIEND_PASS_BONUS);
+        return { bonus: FRIEND_PASS_BONUS };
+      },
+      getBonusToday: async function (key, day) { return mockBonusGet(key, day); },
+    } : {
+      getRow: supabaseFriendPassGetRow,
+      deleteRow: supabaseFriendPassDeleteRow,
+      claimRow: supabaseFriendPassClaim,
+      getBonusToday: supabaseFriendPassBonusGet,
+    };
+    const result = await claimFriendPass(deps, req.params.id, redeemer);
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Friend pass claim error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "The friend pass couldn't be claimed — please try again." });
+  }
+});
+app.get("/friend-pass/bonus", async (req, res) => {
+  /* The caller's own bonus for today (UTC): signed-in users by
+     user id, guests by IP. The frontend uses it to show the real
+     "checks left today" after a claim on any device. A failure
+     answers 0 — the bonus is a nice-to-have, never a blocker. */
+  try {
+    const who = await resolveFriendPassIdentity(req);
+    const today = utcDayKey(new Date());
+    const isMock = process.env.MOCK_AI === "true";
+    const bonus = isMock ? mockBonusGet(who.key, today) : await supabaseFriendPassBonusGet(who.key, today);
+    return res.json({ bonus: typeof bonus === "number" ? bonus : 0, day: today });
+  } catch (error) {
+    return res.json({ bonus: 0, day: utcDayKey(new Date()) });
   }
 });
 /* ---------- Sprint 2: POST /analyze-thread ----------
