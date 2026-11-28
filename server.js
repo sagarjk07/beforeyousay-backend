@@ -1490,6 +1490,23 @@ const RIZZ_MODE_DEFS = {
     ],
     tipFallback: "Practice again tomorrow — small daily reps are how texting gets easier.",
   },
+  roast: {
+    label: "Roast my typing",
+    task: "Roast how the user's own sent texts land, then give better versions of their weakest text",
+    inputRole: "2-3 texts the user actually sent",
+    roastRole: "one playful roast of their typing, 1-2 lines — light, never cruel, nothing sexualised",
+    signalRole: "one line on how their typing lands on the other person",
+    replyRoles: ["a better version of their weakest text", "a funnier version of their weakest text", "a chiller version of their weakest text"],
+    scoreGuide: "score how their typing lands: 0-20 = dry, confusing or impossible to answer, 61-100 = natural, warm and easy to answer.",
+    bands: [
+      { max: 20, label: "Dry typer" },
+      { max: 40, label: "Needs a hook" },
+      { max: 60, label: "Decent typer" },
+      { max: 80, label: "Easy to answer" },
+      { max: 100, label: "Smooth typer" },
+    ],
+    tipFallback: "End with one real question — it gives the other person something to answer.",
+  },
 };
 const STYLE_SAMPLE_MAX_CHARS = 280;
 const PERSON_CONTEXT_MAX_CHARS = 500;
@@ -1611,6 +1628,7 @@ Judge the draft for THIS job, not for charm:
 - work: clear, professional, short. No jokes, no emoji, no flirting.
 - boundary: a clear no. Warm is fine. A guilt paragraph is a fail.
 - practice: score their reply against the scenario in context.
+- roast: roast how the user's own sent texts land — light, never cruel, never sexualised — and write better versions of their weakest text.
 
 verdict is required. send = they can send it. tweak = one fix. wait = wrong moment. dont = do not send, and say why in dontSend.
 Use dont, with empty replies, if the other person is a minor, has asked for no contact, or the user wants to guilt, threaten, or manipulate them.
@@ -1792,6 +1810,22 @@ function buildMockModeResult(mode) {
           { style: "chill", text: "okay, let's talk — what's up?" },
         ],
       };
+    case "roast":
+      return {
+        score: 62, label: "Easy to answer",
+        roast: "Three texts, zero questions — you texted like a read receipt with extra steps.",
+        signal: "It reads friendly but flat — nothing in there asks for a reply back.",
+        tip: "End with one real question — it gives the other person something to answer.",
+        verdict: "send",
+        lands: "Reads casual and harmless — just a bit too easy to leave on read.",
+        dontSend: "",
+        mode: "roast",
+        replies: [
+          { style: "smooth", text: "haha fair — what have you been up to this week?" },
+          { style: "funny", text: "Okay, my texts read like a voicemail from 2009. What are you up to this weekend?" },
+          { style: "chill", text: "haha yeah — what are you doing later?" },
+        ],
+      };
     default:
       return buildMockRizzResult();
   }
@@ -1806,7 +1840,7 @@ function formatRizzResult(data, mode) {
      no invented replies. The label is still recomputed from the
      score and the mode's bands, so it can never disagree with the
      score. A "dont" verdict forces replies to []. Roast is kept
-     only for rizz/dry modes; every other mode gets "".
+     only for rizz/dry/roast modes; every other mode gets "".
      Note on the 2-4 word label rule: the prompt asks the model for
      a 2-4 word label, but the displayed label is always the band
      label for the score — and the band labels ("Smooth",
@@ -1834,7 +1868,7 @@ function formatRizzResult(data, mode) {
   if (typeof data.dontSend !== "string") return null;
   const dontSend = data.dontSend.trim().slice(0, 200);
   if (typeof data.roast !== "string") return null;
-  const roast = (m === "rizz" || m === "dry") ? data.roast.trim().slice(0, 280) : "";
+  const roast = (m === "rizz" || m === "dry" || m === "roast") ? data.roast.trim().slice(0, 280) : "";
   let replies;
   if (verdict === "dont") {
     replies = [];
@@ -2332,6 +2366,97 @@ app.post("/people/summary", analyzeLimiter, async (req, res) => {
   } catch (error) {
     console.error("Person summary error:", error && error.message ? error.message : error);
     return res.status(500).json({ error: "The summary couldn't be updated — please try again." });
+  }
+});
+
+/* ---------- People last reply: POST /people/:id/last-reply ----------
+   Saves the reply the user actually copied for one person, so the
+   next check on that person remembers what was sent. The column
+   (people.last_reply, text, <=500 chars) already exists from
+   migration 004 — nothing wrote it until now, and this needs NO
+   migration. Signed-in only, same auth as POST /people/summary
+   (GET /auth/v1/user via the service-role key, because
+   SUPABASE_JWT_SECRET is not set on Render; guests get 401).
+   The row is updated only where BOTH user_id and id match, so one
+   user can never write another user's person (a missing row, or a
+   row that belongs to someone else, is 404). The frontend calls it
+   fire-and-forget and silent on failure, exactly like
+   POST /people/summary — a failure never blocks the copy.
+   MOCK_AI (local testing only): the in-memory mockPeopleStore is
+   used, same ownership rule as production (a personId already
+   owned by another user is never visible); a missing row is 404,
+   NOT auto-created (unlike /people/summary, which creates the row
+   it summarises). Production mode uses supabasePeoplePatchRow. */
+function sanitiseLastReplyInput(body) {
+  /* Pure validation for POST /people/:id/last-reply. Returns the
+     cleaned input or { error }. The 500-char cap is inlined here on
+     purpose: the logic tests extract this function and run it
+     standalone, so it cannot read a module-level const. */
+  if (!body || typeof body !== "object") return { error: "Add the person first." };
+  const personId = typeof body.personId === "string" ? body.personId.trim() : "";
+  if (!personId) return { error: "Add the person first." };
+  const lastReply = typeof body.lastReply === "string" ? body.lastReply.trim() : "";
+  if (!lastReply) return { error: "Add the reply first." };
+  if (lastReply.length > 500) return { error: "Keep the reply under 500 characters." };
+  return { personId: personId, lastReply: lastReply };
+}
+async function savePersonLastReply(deps, input) {
+  /* Core logic, dependencies injected so the tests can run it without
+     Supabase. deps: { getRow, patchRow }. Returns { status, body } —
+     the route sends it as-is. */
+  const row = await deps.getRow(input.userId, input.personId);
+  if (!row) return { status: 404, body: { error: "That person wasn't found." } };
+  const ok = await deps.patchRow(input.userId, input.personId, { last_reply: input.lastReply, updated_at: new Date().toISOString() });
+  if (!ok) return { status: 500, body: { error: "The reply couldn't be saved — please try again." } };
+  return { status: 200, body: { ok: true } };
+}
+app.post("/people/:id/last-reply", analyzeLimiter, async (req, res) => {
+  try {
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.MOCK_AI !== "true") {
+      return res.status(503).json({ error: "People sync is not set up on the server yet." });
+    }
+    const h = req.headers.authorization || "";
+    if (!h.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Sign in to sync people." });
+    }
+    const token = h.slice(7).trim();
+    let user = null;
+    if (process.env.MOCK_AI === "true" && token.indexOf("mock-user-") === 0) {
+      /* MOCK_AI only: a test token "mock-user-<uuid>" stands in for a
+         signed-in user, so the endpoint can be exercised without
+         Supabase. Never honoured in production. */
+      user = { id: token.slice("mock-user-".length) || null, email: null };
+      if (!user.id) user = null;
+    } else {
+      user = await getSupabaseUserFromToken(token);
+    }
+    if (!user || !user.id) {
+      return res.status(401).json({ error: "Sign in to sync people." });
+    }
+    const input = sanitiseLastReplyInput({ personId: req.params.id, lastReply: (req.body || {}).lastReply });
+    if (input.error) return res.status(400).json({ error: input.error });
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      isMock: true,
+      getRow: mockPersonStoreGet,
+      patchRow: async function (userId, personId, fields) {
+        const row = mockPersonStoreGet(userId, personId);
+        if (!row) return false;
+        Object.keys(fields).forEach(function (k) { row[k] = fields[k]; });
+        return mockPersonStorePut(userId, personId, row) !== null;
+      },
+      callModel: null,
+    } : {
+      isMock: false,
+      getRow: supabasePeopleGetRow,
+      patchRow: supabasePeoplePatchRow,
+      callModel: null,
+    };
+    const result = await savePersonLastReply(deps, { userId: user.id, personId: input.personId, lastReply: input.lastReply });
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Person last reply error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "The reply couldn't be saved — please try again." });
   }
 });
 
