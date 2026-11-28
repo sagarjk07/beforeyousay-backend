@@ -14,6 +14,11 @@ const analyzeLimiter = rateLimit({
   max: 20,
   message: { error: "Too many requests. Please try again later." },
 });
+const voteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: "Too many requests. Please try again later." },
+});
 app.use(cors({
   origin: ["https://beforeyousay.com", "http://localhost:3000"],
   methods: ["GET", "POST"],
@@ -2330,6 +2335,314 @@ app.post("/people/summary", analyzeLimiter, async (req, res) => {
   }
 });
 
+/* ---------- Vote cards: POST /vote-card, GET /vote/:id, POST /vote-cards/:id/vote ----------
+   Sagar's spec (28 Nov 2026): a check result (mode + verdict + 3
+   replies) can be shared as a vote card: anyone with the link votes
+   for reply 1, 2 or 3, and the card shows only the counts. No
+   sign-in, no voter identity is ever stored -- votes are counts
+   only, so a card can never say who voted what.
+   NO situation, NO draft, NO message is ever stored in a vote card
+   -- the card holds mode + verdict + the three replies + counts.
+   NO select policy, NO insert policy: the frontend NEVER touches
+   the vote_cards table directly. Every read and write goes through
+   this backend with the service-role key. Votes move only through
+   the SECURITY DEFINER cast_vote(card_id, choice) RPC (migration
+   005), granted EXECUTE to service_role only -- the browser sends
+   only {choice: 1|2|3} and vote totals are never accepted from a
+   request body.
+   The id is generated on the server: 16 characters from
+   [A-Za-z0-9_-] (12 random bytes, base64url) -- inside the 12-22
+   char CHECK in the table. The old base64 #r= link encoding is
+   never used as an id.
+   Rows older than 30 days are deleted opportunistically: every
+   create and every vote also runs one cleanup delete (failures
+   swallowed, so a cleanup failure never breaks a vote), and a read
+   of an expired card answers 404 and deletes it. No cron, no timer.
+   MOCK_AI (local testing only): cards live in an in-memory Map
+   with the same rules (16-char id, cast_vote semantics, 30-day
+   expiry). Production mode uses the vote_cards table (migration
+   005) through the Supabase REST API with the service-role key,
+   same headers and 5s timeout as the people helpers. Without the
+   service-role key (and not MOCK_AI) the write routes answer 503. */
+const mockVoteStore = new Map(); /* MOCK_AI only: id -> vote card row */
+const VOTE_CARD_TTL_MS = 30 * 24 * 60 * 60 * 1000; /* 30 days */
+function isValidVoteCardId(id) {
+  /* Same shape as the CHECK in migration 005: 12-22 chars from
+     [A-Za-z0-9_-]. The server generates 16-char ids; this guards
+     the generated id and lets the tests assert the shape. */
+  return typeof id === "string" && /^[A-Za-z0-9_-]{12,22}$/.test(id);
+}
+function isExpiredVoteCard(row) {
+  /* Pure, so the tests can call it standalone (the 30-day window
+     is inlined here on purpose -- the logic tests extract this
+     function and run it without the module scope). */
+  if (!row || !row.created_at) return false;
+  const t = Date.parse(row.created_at);
+  if (Number.isNaN(t)) return false;
+  return Date.now() - t > 30 * 24 * 60 * 60 * 1000;
+}
+function generateVoteCardId() {
+  /* 12 random bytes -> 16 base64url chars, alphabet [A-Za-z0-9_-]. */
+  return crypto.randomBytes(12).toString("base64url");
+}
+function sanitiseVoteCardInput(body) {
+  /* Pure validation + normalisation for POST /vote-card. Returns the
+     cleaned input or { error }. The string literals live inside this
+     function on purpose: the logic tests extract it and run it
+     standalone, so it cannot read a module-level const (RIZZ_MODE_DEFS
+     is supplied by the test preamble, as in the people tests). */
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Pick a valid check mode." };
+  const mode = typeof body.mode === "string" ? body.mode.trim() : "";
+  if (mode !== "shot" && mode !== "rizz" && !RIZZ_MODE_DEFS[mode]) return { error: "Pick a valid check mode." };
+  const verdict = typeof body.verdict === "string" ? body.verdict.trim() : "";
+  if (verdict !== "send" && verdict !== "tweak" && verdict !== "wait" && verdict !== "dont") return { error: "Pick a valid verdict." };
+  if (!Array.isArray(body.replies) || body.replies.length !== 3) return { error: "Share exactly three replies." };
+  const replies = [];
+  for (let i = 0; i < body.replies.length; i++) {
+    const entry = body.replies[i];
+    let text = "";
+    if (typeof entry === "string") text = entry.trim();
+    else if (entry && typeof entry === "object" && typeof entry.text === "string") text = entry.text.trim();
+    else return { error: "Share exactly three replies." };
+    if (!text || text.length > 500) return { error: "Share exactly three replies." };
+    replies.push(text);
+  }
+  /* No situation, no draft, no message is ever accepted or stored:
+     a request carrying a situation field is treated exactly as if
+     it carried none. */
+  return { mode: mode, verdict: verdict, replies: replies };
+}
+function sanitiseVoteChoice(choice) {
+  /* Accepts 1, 2, 3 and the strings "1", "2", "3". Anything else is
+     { error }. Pure, so the tests can call it standalone. */
+  if (choice === 1 || choice === "1") return { choice: 1 };
+  if (choice === 2 || choice === "2") return { choice: 2 };
+  if (choice === 3 || choice === "3") return { choice: 3 };
+  return { error: "Pick reply 1, 2 or 3." };
+}
+function voteCardPublic(row) {
+  /* The shape GET /vote/:id returns: replies and votes as arrays,
+     plus the total. Never exposes anything else about the row. */
+  const v1 = typeof row.votes1 === "number" ? row.votes1 : 0;
+  const v2 = typeof row.votes2 === "number" ? row.votes2 : 0;
+  const v3 = typeof row.votes3 === "number" ? row.votes3 : 0;
+  return { id: row.id, mode: row.mode, verdict: row.verdict, replies: [row.reply1, row.reply2, row.reply3], votes: [v1, v2, v3], total: v1 + v2 + v3 };
+}
+async function supabaseVoteCardGetRow(id) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/vote_cards?id=eq." + encodeURIComponent(id) + "&select=*", {
+      headers: { apikey: key, Authorization: "Bearer " + key },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (e) { return null; }
+}
+async function supabaseVoteCardInsertRow(row) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/vote_cards", {
+      method: "POST",
+      headers: { apikey: key, Authorization: "Bearer " + key, "Content-Type": "application/json", Prefer: "return=representation" },
+      body: JSON.stringify(row),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : row;
+  } catch (e) { return null; }
+}
+async function supabaseVoteCardCastVote(id, choice) {
+  /* Calls the SECURITY DEFINER cast_vote RPC (migration 005) with
+     the service-role key. Returns the new counts
+     {votes1, votes2, votes3}, or { notFound: true } when the RPC
+     raises 'card not found', or null on any other failure. The RPC
+     -- never the browser -- decides the new totals. */
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/rpc/cast_vote", {
+      method: "POST",
+      headers: { apikey: key, Authorization: "Bearer " + key, "Content-Type": "application/json" },
+      body: JSON.stringify({ card_id: id, choice: choice }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const data = await res.json().catch(function () { return null; });
+    if (!res.ok) {
+      const msg = data && typeof data.message === "string" ? data.message : "";
+      if (msg.indexOf("card not found") !== -1) return { notFound: true };
+      return null;
+    }
+    if (Array.isArray(data) && data[0]) return { votes1: data[0].votes1, votes2: data[0].votes2, votes3: data[0].votes3 };
+    return null;
+  } catch (e) { return null; }
+}
+async function supabaseVoteCardPruneOld() {
+  /* One opportunistic cleanup delete: rows older than 30 days.
+     Best-effort -- the caller swallows failures, so a cleanup
+     failure never breaks a create or a vote. */
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return false;
+  try {
+    const cutoff = new Date(Date.now() - VOTE_CARD_TTL_MS).toISOString();
+    const res = await fetch(SUPABASE_URL + "/rest/v1/vote_cards?created_at=lt." + encodeURIComponent(cutoff), {
+      method: "DELETE",
+      headers: { apikey: key, Authorization: "Bearer " + key },
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+async function supabaseVoteCardDeleteRow(id) {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!key) return false;
+  try {
+    const res = await fetch(SUPABASE_URL + "/rest/v1/vote_cards?id=eq." + encodeURIComponent(id), {
+      method: "DELETE",
+      headers: { apikey: key, Authorization: "Bearer " + key },
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch (e) { return false; }
+}
+function mockVotePruneOld() {
+  /* MOCK_AI twin of supabaseVoteCardPruneOld: drop expired rows
+     from the in-memory Map. Returns true. */
+  const now = Date.now();
+  mockVoteStore.forEach(function (row, key) {
+    if (row && row.created_at && now - Date.parse(row.created_at) > VOTE_CARD_TTL_MS) mockVoteStore.delete(key);
+  });
+  return true;
+}
+async function createVoteCard(deps, body) {
+  /* Core logic, dependencies injected so the tests can run it without
+     Supabase. deps: { getRow, insertRow, generateId, pruneOldCards? }.
+     Returns { status, body } -- the route sends it as-is. */
+  const input = sanitiseVoteCardInput(body);
+  if (input.error) return { status: 400, body: { error: input.error } };
+  if (!deps || typeof deps.generateId !== "function" || typeof deps.getRow !== "function" || typeof deps.insertRow !== "function") return { status: 500, body: { error: "The vote card couldn't be created — please try again." } };
+  let id = deps.generateId();
+  if (!isValidVoteCardId(id) || await deps.getRow(id)) {
+    /* Bad format or an id collision (rare, but possible):
+       regenerate once, then give up rather than looping forever. */
+    id = deps.generateId();
+    if (!isValidVoteCardId(id) || await deps.getRow(id)) return { status: 500, body: { error: "The vote card couldn't be created — please try again." } };
+  }
+  const row = { id: id, mode: input.mode, verdict: input.verdict, reply1: input.replies[0], reply2: input.replies[1], reply3: input.replies[2], votes1: 0, votes2: 0, votes3: 0, created_at: new Date().toISOString() };
+  const saved = await deps.insertRow(row);
+  if (!saved) return { status: 500, body: { error: "The vote card couldn't be created — please try again." } };
+  /* Opportunistic 30-day cleanup: failures are swallowed so a
+     cleanup failure never breaks a create. */
+  if (deps && typeof deps.pruneOldCards === "function") { try { await deps.pruneOldCards(); } catch (e) { /* ignore */ } }
+  return { status: 201, body: { id: id, url: "/#/vote/" + id, votes: [0, 0, 0], total: 0 } };
+}
+async function getVoteCard(deps, id) {
+  /* Core logic, dependencies injected. deps: { getRow, deleteRow? }.
+     Returns { status, body } -- the route sends it as-is. */
+  if (typeof id !== "string" || !id) return { status: 404, body: { error: "That vote link doesn't exist." } };
+  const row = await deps.getRow(id);
+  if (!row) return { status: 404, body: { error: "That vote link doesn't exist." } };
+  if (isExpiredVoteCard(row)) {
+    /* A card older than 30 days is gone: delete it best-effort and
+       answer 404, so an expired link never renders. */
+    if (deps && typeof deps.deleteRow === "function") { try { await deps.deleteRow(id); } catch (e) { /* ignore */ } }
+    return { status: 404, body: { error: "That vote link doesn't exist." } };
+  }
+  return { status: 200, body: voteCardPublic(row) };
+}
+async function recordVote(deps, id, choice) {
+  /* Core logic, dependencies injected. deps: { castVote,
+     pruneOldCards? }. Returns { status, body } -- the route sends
+     it as-is. The vote moves ONLY through cast_vote: the request
+     carries just the choice, and vote totals are never read from
+     (or written from) a request body. */
+  const checked = sanitiseVoteChoice(choice);
+  if (checked.error) return { status: 400, body: { error: checked.error } };
+  if (!deps || typeof deps.castVote !== "function") return { status: 500, body: { error: "Your vote couldn't be saved — please try again." } };
+  const result = await deps.castVote(id, checked.choice);
+  if (!result) return { status: 500, body: { error: "Your vote couldn't be saved — please try again." } };
+  if (result.notFound) return { status: 404, body: { error: "That vote link doesn't exist." } };
+  const votes = [typeof result.votes1 === "number" ? result.votes1 : 0, typeof result.votes2 === "number" ? result.votes2 : 0, typeof result.votes3 === "number" ? result.votes3 : 0];
+  /* Opportunistic 30-day cleanup, same as on create. */
+  if (typeof deps.pruneOldCards === "function") { try { await deps.pruneOldCards(); } catch (e) { /* ignore */ } }
+  return { status: 200, body: { votes: votes, total: votes[0] + votes[1] + votes[2] } };
+}
+app.post("/vote-card", voteLimiter, async (req, res) => {
+  try {
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.MOCK_AI !== "true") {
+      return res.status(503).json({ error: "Voting is not set up on the server yet." });
+    }
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      getRow: async function (id) { return mockVoteStore.get(id) || null; },
+      insertRow: async function (row) { mockVoteStore.set(row.id, row); return row; },
+      generateId: generateVoteCardId,
+      pruneOldCards: async function () { return mockVotePruneOld(); },
+    } : {
+      getRow: supabaseVoteCardGetRow,
+      insertRow: supabaseVoteCardInsertRow,
+      generateId: generateVoteCardId,
+      pruneOldCards: supabaseVoteCardPruneOld,
+    };
+    const result = await createVoteCard(deps, req.body || {});
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Vote card create error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "The vote card couldn't be created — please try again." });
+  }
+});
+app.get("/vote/:id", async (req, res) => {
+  try {
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      getRow: async function (id) { return mockVoteStore.get(id) || null; },
+      deleteRow: async function (id) { return mockVoteStore.delete(id); },
+    } : {
+      getRow: supabaseVoteCardGetRow,
+      deleteRow: supabaseVoteCardDeleteRow,
+    };
+    const result = await getVoteCard(deps, req.params.id);
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Vote card read error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "That vote link couldn't be loaded — please try again." });
+  }
+});
+app.post("/vote-cards/:id/vote", voteLimiter, async (req, res) => {
+  try {
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY && process.env.MOCK_AI !== "true") {
+      return res.status(503).json({ error: "Voting is not set up on the server yet." });
+    }
+    const body = req.body || {};
+    /* Only the choice is read from the body. Vote totals in the
+       body (votes1/votes2/votes3) are ignored outright -- the new
+       counts come back from cast_vote, never from the browser. */
+    const isMock = process.env.MOCK_AI === "true";
+    const deps = isMock ? {
+      castVote: async function (id, choice) {
+        const row = mockVoteStore.get(id);
+        if (!row) return { notFound: true };
+        if (choice === 1) row.votes1 += 1;
+        else if (choice === 2) row.votes2 += 1;
+        else row.votes3 += 1;
+        return { votes1: row.votes1, votes2: row.votes2, votes3: row.votes3 };
+      },
+      pruneOldCards: async function () { return mockVotePruneOld(); },
+    } : {
+      castVote: supabaseVoteCardCastVote,
+      pruneOldCards: supabaseVoteCardPruneOld,
+    };
+    const result = await recordVote(deps, req.params.id, body.choice);
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Vote error:", error && error.message ? error.message : error);
+    return res.status(500).json({ error: "Your vote couldn't be saved — please try again." });
+  }
+});
 /* ---------- Sprint 2: POST /analyze-thread ----------
    Same guards as /analyze: lane whitelist, signed-in daily limit (a
    thread counts as one check), Turnstile, 60s vision timeout, safe
